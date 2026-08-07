@@ -130,10 +130,15 @@ class SuffixGPUDrafter:
             lengths: host-side token counts for those rows.
             token_ids_gpu: [M, S] int32 resident token buffer.
         """
-        if self.global_index is None or not row_indices:
+        rows = [token_ids_gpu[r] for r in row_indices]
+        self.harvest_rows(rows, lengths)
+
+    def harvest_rows(self, rows: list[torch.Tensor],
+                      lengths: list[int]) -> None:
+        """Ingest pre-sliced token rows into the global index."""
+        if self.global_index is None or not rows:
             return
-        docs = [token_ids_gpu[r, :ln] for r, ln in zip(row_indices, lengths)
-                if ln > 0]
+        docs = [row[:ln] for row, ln in zip(rows, lengths) if ln > 0]
         if docs:
             self.global_index.append_documents(docs)
 
