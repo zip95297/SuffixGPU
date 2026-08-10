@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import torch
 
+from suffix_gpu import triton_kernels
 from suffix_gpu.expand import expand_chain
 from suffix_gpu.global_index import GlobalIndex
 from suffix_gpu.local_matcher import LocalMatchKernel
@@ -138,6 +139,10 @@ class SuffixGPUDrafter:
             valid_sampled_tokens_count = (
                 sampled_token_ids != -1).sum(dim=1)
         cnt = valid_sampled_tokens_count.to(torch.int64)
+        if triton_kernels.available(token_ids_gpu, sampled_token_ids):
+            triton_kernels.scatter_append(
+                token_ids_gpu, base, cnt, sampled_token_ids)
+            return (base + cnt).to(torch.int32)
         # One column per iteration: clamped out-of-range positions would
         # collide across columns in a single scatter and race.
         for j in range(t):

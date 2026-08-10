@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import torch
 
+from suffix_gpu import triton_kernels
+
 
 def _majority_token(values: torch.Tensor, active: torch.Tensor,
                      sentinel: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -72,6 +74,9 @@ def expand_chain(
     """
     b, r, _ = cont.shape
     device = cont.device
+    if sentinel == -1 and triton_kernels.available(cont, num_occ):
+        return triton_kernels.expand_chain(cont, num_occ, k,
+                                           min_token_prob)
     offs = torch.arange(r, device=device)
     active = offs.unsqueeze(0) < num_occ.unsqueeze(1)
     chain = torch.full((b, k), sentinel, dtype=cont.dtype, device=device)

@@ -122,6 +122,7 @@ def sim_gpu(
     device: torch.device,
     name: str,
     ingest_chunk: int = 64,
+    use_graph: bool = False,
 ) -> SimResult:
     b = len(streams)
     total = max(len(s) for s in streams)
@@ -142,6 +143,22 @@ def sim_gpu(
     sampled_buf = torch.full((b, k + 1), -1, dtype=torch.int32,
                              device=device)
 
+    graph = None
+    if use_graph and device.type == "cuda":
+        # Warm up (Triton JIT, allocator) on scratch state, then
+        # capture the full update+propose chain; the graph feeds the
+        # new counts back into its own input buffer.
+        wb, wn, ws = buf.clone(), num_tok_t.clone(), sampled_buf.clone()
+        for _ in range(3):
+            drafter.propose_with_update(wn, wb, ws)
+        torch.cuda.synchronize(device)
+        del wb, wn, ws
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            draft_t, nv_t, nc_t = drafter.propose_with_update(
+                num_tok_t, buf, sampled_buf)
+            num_tok_t.copy_(nc_t)
+
     while not (finished & (np.array([len(p) for p in pending]) == 0)).all():
         sampled_np = np.full((b, k + 1), -1, dtype=np.int32)
         for i in range(b):
@@ -152,8 +169,12 @@ def sim_gpu(
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         t0 = time.perf_counter()
-        draft_t, nv_t, num_tok_t = drafter.propose_with_update(
-            num_tok_t, buf, sampled_buf)
+        if graph is not None:
+            graph.replay()
+        else:
+            draft_t, nv_t, nc_t = drafter.propose_with_update(
+                num_tok_t, buf, sampled_buf)
+            num_tok_t.copy_(nc_t)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         res.step_ms.append((time.perf_counter() - t0) * 1e3)
@@ -289,7 +310,12 @@ def run_accuracy(args, device: torch.device) -> None:
                         w, f"cpu-wave{w}")
             print("  " + r.report())
 
-        for enable_global, tag in ((True, "gpu"), (False, "gpu-localonly")):
+        variants = [(True, False, "gpu-eager"), (True, True, "gpu-graph"),
+                    (False, False, "gpu-local-eager"),
+                    (False, True, "gpu-local-graph")]
+        for enable_global, use_graph, tag in variants:
+            if use_graph and device.type != "cuda":
+                continue
             drafter = SuffixGPUDrafter(
                 k=args.k, device=device, max_pattern_len=args.depth,
                 min_match_len=1, max_occurrences=32,
@@ -302,7 +328,7 @@ def run_accuracy(args, device: torch.device) -> None:
             )
             for w, streams in enumerate(waves):
                 r = sim_gpu(drafter, streams, args.prompt_len, device,
-                            f"{tag}-wave{w}")
+                            f"{tag}-wave{w}", use_graph=use_graph)
                 print("  " + r.report())
             del drafter
 
