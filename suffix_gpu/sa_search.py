@@ -6,6 +6,11 @@ torch.compile friendly. Index tensors are int64 throughout.
 Pattern convention: patterns are passed padded to a fixed width ``M``
 together with per-row valid lengths, since different requests match
 different-length suffixes.
+
+Hot-path structure: search_interval resolves the lower and upper bound
+in one merged binary-search loop (2B rows), and longest_suffix_match
+searches all candidate lengths 1..max_len as one batch instead of an
+outer per-length binary search, so the SA is walked exactly once.
 """
 
 from __future__ import annotations
@@ -64,6 +69,9 @@ def search_interval(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """SA interval [start, end) of suffixes starting with each pattern.
 
+    Lower bound (first cmp >= 0) and upper bound (first cmp > 0) are
+    resolved together in a single fixed-iteration loop over 2B rows.
+
     Args:
         sa: suffix array [n] i64.
         corpus: token corpus [n] int.
@@ -78,46 +86,21 @@ def search_interval(
     iters = max(1, math.ceil(math.log2(n + 1)))
     b = pattern.shape[0]
     device = sa.device
-    zero = torch.zeros(b, dtype=torch.int64, device=device)
-    full = torch.full((b,), n, dtype=torch.int64, device=device)
-
-    # Lower bound: first SA index with cmp >= 0.
-    lo, hi = zero.clone(), full.clone()
+    pat2 = torch.cat([pattern, pattern], dim=0)
+    plen2 = torch.cat([pattern_len, pattern_len], dim=0)
+    is_upper = torch.zeros(2 * b, dtype=torch.bool, device=device)
+    is_upper[b:] = True
+    lo = torch.zeros(2 * b, dtype=torch.int64, device=device)
+    hi = torch.full((2 * b,), n, dtype=torch.int64, device=device)
     for _ in range(iters):
         # Converged rows can produce mid == n; clamp, the cmp is a no-op
         # there since where() leaves lo/hi unchanged.
         mid = ((lo + hi) // 2).clamp(max=n - 1)
-        c = _cmp_pattern(sa, corpus, mid, pattern, pattern_len)
-        lo = torch.where(c < 0, mid + 1, lo)
-        hi = torch.where(c < 0, hi, mid)
-    start = lo
-
-    # Upper bound: first SA index with cmp > 0.
-    lo, hi = zero.clone(), full.clone()
-    for _ in range(iters):
-        mid = ((lo + hi) // 2).clamp(max=n - 1)
-        c = _cmp_pattern(sa, corpus, mid, pattern, pattern_len)
-        lo = torch.where(c <= 0, mid + 1, lo)
-        hi = torch.where(c <= 0, hi, mid)
-    return start, lo
-
-
-def _tail_pattern(
-    query: torch.Tensor,
-    query_len: torch.Tensor,
-    length: torch.Tensor,
-    width: int,
-) -> torch.Tensor:
-    """Padded pattern [B, width] holding query[-length:] per row."""
-    q = query.shape[1]
-    device = query.device
-    b = query.shape[0]
-    offs = torch.arange(width, dtype=torch.int64, device=device)
-    jidx = query_len.unsqueeze(1) - length.unsqueeze(1) + offs.unsqueeze(0)
-    valid = (offs.unsqueeze(0) < length.unsqueeze(1)) & (jidx >= 0)
-    tok = torch.where(
-        valid, query[:, :q].gather(1, jidx.clamp(0, q - 1)), 0)
-    return tok
+        c = _cmp_pattern(sa, corpus, mid, pat2, plen2)
+        go_right = (c < 0) | (is_upper & (c == 0))
+        lo = torch.where(go_right, mid + 1, lo)
+        hi = torch.where(go_right, hi, mid)
+    return lo[:b], lo[b:]
 
 
 def longest_suffix_match(
@@ -129,9 +112,9 @@ def longest_suffix_match(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Longest suffix of each query that occurs in the corpus.
 
-    The predicate "suffix of length L occurs" is monotone in L, so the
-    length is found by a fixed-iteration binary search, each step of
-    which is a full SA interval search.
+    All candidate lengths 1..max_len are searched as one flattened
+    batch (B * max_len rows) in a single interval search, then the
+    longest non-empty interval is selected per query.
 
     Args:
         sa: suffix array [n] i64.
@@ -142,22 +125,31 @@ def longest_suffix_match(
 
     Returns:
         (match_len [B] i64, start [B] i64, end [B] i64) where
-        [start, end) is the SA interval at the matched length.
+        [start, end) is the SA interval at the matched length; (0, 0)
+        when there is no match.
     """
-    b = query.shape[0]
+    b, q = query.shape
+    m = max_len
     device = sa.device
-    zero = torch.zeros(b, dtype=torch.int64, device=device)
-    hi = torch.full((b,), max_len, dtype=torch.int64, device=device)
-    lo = zero.clone()
-    iters = max(1, math.ceil(math.log2(max_len + 1)))
-    for _ in range(iters):
-        mid = (lo + hi + 1) // 2
-        pattern = _tail_pattern(query, query_len, mid, max_len)
-        plen = mid.expand(b).contiguous()
-        s, e = search_interval(sa, corpus, pattern, plen)
-        pred = (e > s) & (query_len >= mid)
-        lo = torch.where(pred, mid, lo)
-        hi = torch.where(pred, hi, mid - 1)
-    pattern = _tail_pattern(query, query_len, lo, max_len)
-    start, end = search_interval(sa, corpus, pattern, lo)
-    return lo, start, end
+    lengths = torch.arange(1, m + 1, dtype=torch.int64, device=device)
+    offs = torch.arange(m, dtype=torch.int64, device=device)
+    # pattern[b, l, j] = query[query_len - (l+1) + j], zero-padded.
+    idx = (query_len.view(b, 1, 1) - lengths.view(1, m, 1)
+           + offs.view(1, 1, m))
+    valid = (offs.view(1, 1, m) < lengths.view(1, m, 1)) & (idx >= 0)
+    tok = query.gather(1, idx.clamp(0, q - 1).reshape(b, m * m)
+                       ).reshape(b, m, m)
+    pat = torch.where(valid, tok, torch.zeros_like(tok))
+    start, end = search_interval(
+        sa, corpus, pat.reshape(b * m, m),
+        lengths.view(1, m).expand(b, m).reshape(-1))
+    start = start.view(b, m)
+    end = end.view(b, m)
+    found = (end > start) & (lengths.view(1, m) <= query_len.view(b, 1))
+    best = (found.to(torch.int64) * lengths.view(1, m)).max(dim=1).values
+    pick = (best - 1).clamp(min=0).unsqueeze(1)
+    s_best = start.gather(1, pick).squeeze(1)
+    e_best = end.gather(1, pick).squeeze(1)
+    zero = torch.zeros_like(s_best)
+    return (best, torch.where(best > 0, s_best, zero),
+            torch.where(best > 0, e_best, zero))

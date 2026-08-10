@@ -14,49 +14,31 @@ def _majority_token(values: torch.Tensor, active: torch.Tensor,
                      sentinel: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-row majority token among active entries, with its vote count.
 
+    Pairwise-equality vote count: R (max_occurrences) is small, so the
+    [B, R, R] comparison is cheaper than a sort + run-length scan.
+
     Args:
         values: [B, R] token values (garbage allowed in inactive slots).
         active: [B, R] bool mask of valid entries.
-        sentinel: value marking inactive slots; must sort below every
-            real token id (use -1 for token ids >= 0).
+        sentinel: value returned for rows with no active entry.
 
     Returns:
         (token [B], count [B]): rows with no active entry get
-        (`sentinel`, 0).
+        (`sentinel`, 0). Ties resolve to the smallest token id.
     """
-    b, r = values.shape
-    masked = torch.where(active, values, sentinel)
-    sorted_v, _ = torch.sort(masked, dim=1)
-    real = sorted_v != sentinel
-    prev_v = torch.cat(
-        [torch.full((b, 1), sentinel, dtype=sorted_v.dtype,
-                    device=values.device), sorted_v[:, :-1]], dim=1)
-    boundary = real & ((sorted_v != prev_v) |
-                       ~torch.cat([torch.ones(b, 1, dtype=torch.bool,
-                                              device=values.device),
-                                   real[:, :-1]], dim=1))
-    pos_idx = torch.arange(r, dtype=torch.int64, device=values.device)
-    run_start = torch.cummax(
-        torch.where(boundary, pos_idx.unsqueeze(0),
-                    torch.zeros(b, r, dtype=torch.int64,
-                                device=values.device)), dim=1).values
-    run_len = pos_idx.unsqueeze(0) - run_start + 1
-    run_end = real & torch.cat(
-        [sorted_v[:, 1:] != sorted_v[:, :-1],
-         torch.ones(b, 1, dtype=torch.bool, device=values.device)], dim=1)
-    run_len = torch.where(run_end, run_len, torch.zeros_like(run_len))
-    max_cnt = run_len.max(dim=1, keepdim=True).values
-    winner = run_end & (run_len == max_cnt) & (max_cnt > 0)
-    # Ties resolve to the smallest token id (rows are sorted ascending).
+    eq = values.unsqueeze(2) == values.unsqueeze(1)
+    votes = (eq & active.unsqueeze(1)).sum(dim=2)
+    votes = torch.where(active, votes, torch.zeros_like(votes))
+    max_cnt = votes.max(dim=1, keepdim=True).values
+    winner = active & (votes == max_cnt) & (max_cnt > 0)
     cand = torch.where(
-        winner, sorted_v.to(torch.int64),
-        torch.full_like(sorted_v, torch.iinfo(torch.int64).max,
+        winner, values.to(torch.int64),
+        torch.full_like(values, torch.iinfo(torch.int64).max,
                         dtype=torch.int64))
-    first_win = cand.argmin(dim=1)
-    token = sorted_v.gather(1, first_win.unsqueeze(1)).squeeze(1)
+    tok = cand.min(dim=1).values
     any_active = active.any(dim=1)
-    token = torch.where(any_active, token,
-                        torch.full_like(token, sentinel))
+    token = torch.where(any_active, tok,
+                        torch.full_like(tok, sentinel)).to(values.dtype)
     count = torch.where(any_active, max_cnt.squeeze(1),
                         torch.zeros_like(max_cnt.squeeze(1)))
     return token, count
