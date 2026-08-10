@@ -156,3 +156,94 @@ def test_proposer_global_harvest(device):
     assert nv[1].item() == len(exp_chain)
     assert draft[1].tolist()[:nv[1].item()] == exp_chain
     assert nv[0].item() == 0
+
+
+def test_delta_occurrence_positions_compacted(device):
+    """Regression (P0-1): occurrence positions must be compacted left.
+
+    The buggy path emitted fake "position 0" rows for unmatched slots,
+    which joined the majority vote and could flip the drafted token.
+    """
+    idx = GlobalIndex(capacity=1024, delta_capacity=256, k=K,
+                      max_occurrences=R, rebuild_threshold=100000,
+                      device=device)
+    # [7, 7] occurs at positions 1, 10 and 19, all continuing with 101;
+    # position 0 starts with a different token on purpose.
+    doc = [9, 7, 7, 101, 5, 5, 5, 5, 5, 3,
+           7, 7, 101, 6, 6, 6, 6, 6, 6,
+           7, 7, 101, 4]
+    _append(idx, [doc], device)
+
+    q = torch.tensor([[7, 7] + [0] * (P - 2)], dtype=torch.int32,
+                     device=device)
+    qlen = torch.tensor([2], dtype=torch.int64, device=device)
+    d_len, d_pos, d_cnt = idx._delta_match(q, qlen, P)
+    assert d_len[0].item() == 2
+    assert d_cnt[0].item() == 3
+    assert d_pos[0, :3].tolist() == [1, 10, 19]
+
+    chain, mlen, occ = _query(idx, [7, 7], device)
+    exp_chain, exp_len = _naive_chain(doc, [7, 7], K, P)
+    assert mlen == exp_len
+    assert occ == 3
+    assert chain == exp_chain
+    assert chain[0] == 101
+
+
+def test_delta_match_len_full_verification(device):
+    """Regression (P0-2): a common first token must not hide a longer
+    match sitting past the first `max_occurrences` seed positions."""
+    idx = GlobalIndex(capacity=1024, delta_capacity=256, k=K,
+                      max_occurrences=4, rebuild_threshold=100000,
+                      device=device)
+    # 10 early positions start with token 1 but do not match; the only
+    # occurrence of [1, 2, 3, 4] sits at the end of the delta.
+    doc = [1, 9] * 10 + [1, 2, 3, 4, 6]
+    _append(idx, [doc], device)
+    chain, mlen, occ = _query(idx, [1, 2, 3, 4], device)
+    assert mlen == naive_longest_suffix_match(doc, [1, 2, 3, 4], P) == 4
+    assert occ == 1
+    assert chain == [6]
+
+
+class _NeverDoneEvent:
+    """Stands in for an in-flight CUDA rebuild event."""
+
+    def query(self) -> bool:
+        return False
+
+
+def test_delta_overflow_with_rebuild_in_flight(device):
+    """Regression (P0-3): appends that overflow the delta while a
+    rebuild is in flight must drop oldest docs, not crash copy_."""
+    idx = GlobalIndex(capacity=64, delta_capacity=16, k=K,
+                      max_occurrences=R, rebuild_threshold=100000,
+                      device=device)
+    _append(idx, [[1] * 6, [2] * 6], device)
+    idx._rebuild_event = _NeverDoneEvent()
+    idx._pending = (idx.active_len, idx.active_doc_lens)
+    _append(idx, [[3] * 10], device)  # 12 + 10 > 16: must make room
+    assert idx.delta_len <= idx.delta_capacity
+    _, mlen_new, _ = _query(idx, [3, 3], device)
+    assert mlen_new == 2
+    _, mlen_kept, _ = _query(idx, [2, 2], device)
+    assert mlen_kept == 2
+    _, mlen_dropped, _ = _query(idx, [1, 1], device)
+    assert mlen_dropped == 0
+    idx._rebuild_event = None
+    idx._pending = None
+
+
+def test_delta_overflow_sync_rebuild(device):
+    """Overflow with no rebuild in flight absorbs the delta into the SA."""
+    idx = GlobalIndex(capacity=64, delta_capacity=16, k=K,
+                      max_occurrences=R, rebuild_threshold=100000,
+                      device=device)
+    _append(idx, [[1] * 12], device)
+    _append(idx, [[2] * 12], device)
+    assert idx.active_len == 12
+    assert idx.delta_len == 12
+    _, mlen_sa, _ = _query(idx, [1, 1], device)
+    assert mlen_sa == 2
+    _, mlen_delta, _ = _query(idx, [2, 2], device)
+    assert mlen_delta == 2

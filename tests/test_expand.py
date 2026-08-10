@@ -11,8 +11,9 @@ def test_majority_basic(device):
                           device=device)
     active = torch.tensor([[True] * 5, [True, True, True, False, False]],
                           device=device)
-    out = _majority_token(values, active, -1)
-    assert out.tolist() == [7, 1]
+    tok, cnt = _majority_token(values, active, -1)
+    assert tok.tolist() == [7, 1]
+    assert cnt.tolist() == [3, 2]
 
 
 def test_majority_run_lengths(device):
@@ -20,20 +21,26 @@ def test_majority_run_lengths(device):
     values = torch.tensor([[5, 7, 5, 5, -1]], dtype=torch.int32,
                           device=device)
     active = torch.tensor([[True] * 5], device=device)
-    assert _majority_token(values, active, -1).tolist() == [5]
+    tok, cnt = _majority_token(values, active, -1)
+    assert tok.tolist() == [5]
+    assert cnt.tolist() == [3]
 
 
 def test_majority_tie_smallest_token(device):
     values = torch.tensor([[9, 9, 3, 3, -1]], dtype=torch.int32,
                           device=device)
     active = torch.tensor([[True] * 5], device=device)
-    assert _majority_token(values, active, -1).tolist() == [3]
+    tok, cnt = _majority_token(values, active, -1)
+    assert tok.tolist() == [3]
+    assert cnt.tolist() == [2]
 
 
 def test_majority_empty_row(device):
     values = torch.zeros(1, 4, dtype=torch.int32, device=device)
     active = torch.zeros(1, 4, dtype=torch.bool, device=device)
-    assert _majority_token(values, active, -1).tolist() == [-1]
+    tok, cnt = _majority_token(values, active, -1)
+    assert tok.tolist() == [-1]
+    assert cnt.tolist() == [0]
 
 
 def test_expand_chain_exact(device):

@@ -3,6 +3,12 @@
 The local path matches each request's own history; the global path
 matches a cross-request suffix index over finished responses. The two
 candidates are scored by (match_len, occurrence_count) per request.
+
+Draft length is adaptive, mirroring arctic_inference SuffixDecoding:
+each candidate chain is truncated to
+``max_spec_factor * match_len + max_spec_offset`` tokens, and chain
+expansion stops once the estimated chain probability falls below
+``min_token_prob``.
 """
 
 from __future__ import annotations
@@ -33,15 +39,22 @@ class SuffixGPUDrafter:
         delta_capacity: int = 1 << 16,
         rebuild_threshold: int | None = None,
         rebuild_stream: torch.cuda.Stream | None = None,
+        max_spec_factor: float | None = None,
+        max_spec_offset: float = 0.0,
+        min_token_prob: float = 0.0,
     ):
         self.k = k
         self.device = torch.device(device)
         self.max_pattern_len = max_pattern_len
+        self.max_spec_factor = max_spec_factor
+        self.max_spec_offset = max_spec_offset
+        self.min_token_prob = min_token_prob
         self.local_kernel = LocalMatchKernel(
             k=k,
             max_pattern_len=max_pattern_len,
             min_match_len=min_match_len,
             max_occurrences=max_occurrences,
+            min_token_prob=min_token_prob,
         ).to(self.device)
         self.global_index: GlobalIndex | None = None
         if enable_global:
@@ -72,6 +85,24 @@ class SuffixGPUDrafter:
             valid, token_ids_gpu.gather(1, idx.clamp(0, s - 1)), 0)
         return tails, tail_len
 
+    def _clamp_spec(self, num_valid: torch.Tensor,
+                    match_len: torch.Tensor) -> torch.Tensor:
+        """Adaptive cap: factor * match_len + offset (arctic semantics)."""
+        if self.max_spec_factor is None:
+            return num_valid
+        limit = (self.max_spec_factor * match_len.to(torch.float32)
+                 + self.max_spec_offset).floor().to(torch.int64)
+        limit = limit.clamp(min=0)
+        return torch.minimum(num_valid.to(torch.int64), limit)
+
+    def poll(self) -> None:
+        """Host-side: swap in a finished background rebuild, if any.
+
+        Call once per step outside the (compile-safe) propose path.
+        """
+        if self.global_index is not None:
+            self.global_index.poll_rebuild()
+
     def propose(
         self,
         num_tokens_no_spec: torch.Tensor,
@@ -94,28 +125,36 @@ class SuffixGPUDrafter:
                 b, dtype=torch.bool, device=self.device)
         local_draft, local_nv, local_len, local_occ = self.local_kernel(
             num_tokens_no_spec, token_ids_gpu, combined_mask)
+        local_nv = self._clamp_spec(local_nv, local_len)
+
         if self.global_index is None:
-            return local_draft, local_nv
+            draft, num_valid = local_draft, local_nv
+        else:
+            tails, tail_len = self._gather_tails(num_tokens_no_spec,
+                                                 token_ids_gpu)
+            g_len, cont, occ_cnt = self.global_index.query(
+                tails.to(torch.int32), tail_len, self.max_pattern_len)
+            g_chain, g_nv = expand_chain(
+                cont, occ_cnt, self.k, min_token_prob=self.min_token_prob)
+            g_chain = torch.where(g_len.unsqueeze(1) > 0, g_chain, -1)
+            g_nv = torch.where(g_len > 0, g_nv, torch.zeros_like(g_nv))
+            g_nv = self._clamp_spec(g_nv, g_len)
 
-        tails, tail_len = self._gather_tails(num_tokens_no_spec,
-                                             token_ids_gpu)
-        g_len, cont, occ_cnt = self.global_index.query(
-            tails.to(torch.int32), tail_len, self.max_pattern_len)
-        g_chain, g_nv = expand_chain(cont, occ_cnt, self.k)
-        g_chain = torch.where(g_len.unsqueeze(1) > 0, g_chain, -1)
-        g_nv = torch.where(g_len > 0, g_nv, torch.zeros_like(g_nv))
+            pick_global = ((g_len > local_len.to(torch.int64))
+                           | ((g_len == local_len.to(torch.int64))
+                              & (occ_cnt > local_occ)
+                              & (g_len > 0))) & combined_mask
+            draft = torch.where(pick_global.unsqueeze(1),
+                                g_chain.to(torch.int32), local_draft)
+            num_valid = torch.where(pick_global, g_nv.to(torch.int64),
+                                    local_nv.to(torch.int64))
 
-        pick_global = ((g_len > local_len.to(torch.int64))
-                       | ((g_len == local_len.to(torch.int64))
-                          & (occ_cnt > local_occ)
-                          & (g_len > 0))) & combined_mask
-        draft = torch.where(pick_global.unsqueeze(1),
-                            g_chain.to(torch.int32), local_draft)
-        num_valid = torch.where(pick_global, g_nv.to(torch.int32),
-                                local_nv)
         num_valid = torch.where(
-            combined_mask, num_valid, torch.zeros_like(num_valid))
-        return draft, num_valid
+            combined_mask, num_valid.to(torch.int64),
+            torch.zeros(b, dtype=torch.int64, device=self.device))
+        slot = torch.arange(self.k, device=self.device).unsqueeze(0)
+        draft = torch.where(slot < num_valid.unsqueeze(1), draft, -1)
+        return draft.to(torch.int32), num_valid.to(torch.int32)
 
     def harvest_finished(
         self,

@@ -11,8 +11,8 @@ import torch
 
 
 def _majority_token(values: torch.Tensor, active: torch.Tensor,
-                     sentinel: int) -> torch.Tensor:
-    """Per-row majority token among active entries.
+                     sentinel: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-row majority token among active entries, with its vote count.
 
     Args:
         values: [B, R] token values (garbage allowed in inactive slots).
@@ -21,7 +21,8 @@ def _majority_token(values: torch.Tensor, active: torch.Tensor,
             real token id (use -1 for token ids >= 0).
 
     Returns:
-        [B] int tensor; rows with no active entry get `sentinel`.
+        (token [B], count [B]): rows with no active entry get
+        (`sentinel`, 0).
     """
     b, r = values.shape
     masked = torch.where(active, values, sentinel)
@@ -54,8 +55,11 @@ def _majority_token(values: torch.Tensor, active: torch.Tensor,
     first_win = cand.argmin(dim=1)
     token = sorted_v.gather(1, first_win.unsqueeze(1)).squeeze(1)
     any_active = active.any(dim=1)
-    return torch.where(any_active, token,
-                       torch.full_like(token, sentinel))
+    token = torch.where(any_active, token,
+                        torch.full_like(token, sentinel))
+    count = torch.where(any_active, max_cnt.squeeze(1),
+                        torch.zeros_like(max_cnt.squeeze(1)))
+    return token, count
 
 
 def expand_chain(
@@ -63,6 +67,7 @@ def expand_chain(
     num_occ: torch.Tensor,
     k: int,
     sentinel: int = -1,
+    min_token_prob: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build a draft chain by depth-wise majority vote over continuations.
 
@@ -74,6 +79,10 @@ def expand_chain(
             request (rows beyond it are ignored).
         k: draft length.
         sentinel: padding value sorting below all real tokens.
+        min_token_prob: stop the chain once its estimated probability
+            (product of per-depth vote fractions, mirroring
+            child.count / node.count on a suffix tree) drops below this
+            threshold. 0 disables the cutoff.
 
     Returns:
         (chain [B, k] int, num_valid [B] int64): the majority-vote
@@ -85,10 +94,14 @@ def expand_chain(
     active = offs.unsqueeze(0) < num_occ.unsqueeze(1)
     chain = torch.full((b, k), sentinel, dtype=cont.dtype, device=device)
     prefix_ok = active.clone()
+    cum_prob = torch.ones(b, dtype=torch.float32, device=device)
     for d in range(k):
         active_d = prefix_ok & (cont[:, :, d] != sentinel)
-        tok = _majority_token(cont[:, :, d], active_d, sentinel)
-        valid = tok != sentinel
+        tok, cnt = _majority_token(cont[:, :, d], active_d, sentinel)
+        n_active = active_d.sum(dim=1).clamp(min=1)
+        cum_prob = cum_prob * (cnt.to(torch.float32)
+                               / n_active.to(torch.float32))
+        valid = (tok != sentinel) & (cum_prob >= min_token_prob)
         chain[:, d] = torch.where(valid, tok, chain[:, d])
         prefix_ok = (
             prefix_ok

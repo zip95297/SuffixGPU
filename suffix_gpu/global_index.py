@@ -1,14 +1,23 @@
 """Cross-request global memory: suffix array over finished responses.
 
-Design (phase 1):
+Design (phase 2):
 - The active (corpus, SA) pair is immutable between rebuilds, so the
   query path never races with writers.
+- Query shapes are static: the corpus buffer is padded with a sentinel
+  token (int32 max) that sorts after every real token, and searches
+  always run over the full capacity. The SA is built over the real
+  prefix plus one sentinel column (build and query then agree on suffix
+  ordering); padding entries are appended in position order, which is
+  valid because every all-sentinel suffix compares greater than any
+  real-token pattern. The delta path masks by a device-side length
+  scalar instead of slicing.
 - New documents land in an append-only delta buffer and are matched by
-  seed-and-verify brute force.
+  full brute-force verification (rolling AND over pattern offsets).
 - Rebuild copies (eviction-trimmed active corpus + delta snapshot) into
-  the staging buffer, builds a fresh SA (on a side stream under CUDA),
-  and swaps the active pair once the build event completes. Tokens
-  appended after the snapshot stay in the delta until the next rebuild.
+  the staging buffer and immediately compacts the snapshot out of the
+  delta (staging owns a copy), so appends always have the full delta
+  capacity available while the SA builds on a side stream. The active
+  pair swaps once the build event completes.
 """
 
 from __future__ import annotations
@@ -21,6 +30,8 @@ import torch
 from suffix_gpu.expand import expand_chain
 from suffix_gpu.sa_search import longest_suffix_match
 from suffix_gpu.suffix_array import build_suffix_array
+
+PAD_TOKEN = torch.iinfo(torch.int32).max
 
 
 class GlobalIndex:
@@ -45,24 +56,23 @@ class GlobalIndex:
         self.device = torch.device(device)
         self.rebuild_stream = rebuild_stream
 
-        self.corpus = torch.zeros(capacity, dtype=torch.int32,
-                                  device=self.device)
-        self.sa = torch.zeros(capacity, dtype=torch.int64,
-                              device=self.device)
-        self.staging_corpus = torch.zeros(capacity, dtype=torch.int32,
-                                          device=self.device)
-        self.staging_sa = torch.zeros(capacity, dtype=torch.int64,
-                                      device=self.device)
+        self.corpus = torch.full((capacity,), PAD_TOKEN, dtype=torch.int32,
+                                 device=self.device)
+        self.staging_corpus = self.corpus.clone()
+        self.sa = torch.arange(capacity, dtype=torch.int64,
+                               device=self.device)
+        self.staging_sa = self.sa.clone()
         self.delta = torch.zeros(delta_capacity, dtype=torch.int32,
                                  device=self.device)
+        self.delta_len_t = torch.zeros((), dtype=torch.int64,
+                                       device=self.device)
 
         self.active_len = 0
         self.delta_len = 0
-        self.delta_snap = 0
         self.active_doc_lens: deque[int] = deque()
         self.delta_doc_lens: list[int] = []
         self._rebuild_event: torch.cuda.Event | None = None
-        self._pending: tuple[int, deque[int], int] | None = None
+        self._pending: tuple[int, deque[int]] | None = None
 
     # ------------------------------------------------------------------
     # writes
@@ -81,56 +91,50 @@ class GlobalIndex:
                 self._make_room(n)
             self.delta[self.delta_len:self.delta_len + n].copy_(doc)
             self.delta_len += n
+            self.delta_len_t.fill_(self.delta_len)
             self.delta_doc_lens.append(n)
         self.maybe_rebuild()
 
     def _make_room(self, needed: int) -> None:
+        self.poll_rebuild()
         if self._rebuild_event is None:
-            self._launch_rebuild(force=True)
+            self._launch_rebuild()
         if self.delta_len + needed <= self.delta_capacity:
             return
-        # Background rebuild pending: drop oldest pending docs.
-        pending_tokens = self.delta_len - self.delta_snap
-        keep = max(0, self.delta_capacity - needed - self.delta_snap)
-        drop = pending_tokens - keep
-        if drop > 0:
-            self._drop_pending_tokens(drop)
+        # A rebuild is in flight (staging buffers busy): drop oldest docs.
+        self._drop_oldest_docs(
+            self.delta_len + needed - self.delta_capacity)
 
-    def _drop_pending_tokens(self, drop: int) -> None:
+    def _drop_oldest_docs(self, drop: int) -> None:
         acc = 0
         docs_dropped = 0
-        for ln in self.delta_doc_lens[self._count_docs_within(
-                self.delta_snap):]:
+        for ln in self.delta_doc_lens:
             if acc >= drop:
                 break
             acc += ln
             docs_dropped += 1
-        if acc < drop:
-            return
-        start = self.delta_snap + acc
-        remaining = self.delta_len - start
+        remaining = self.delta_len - acc
         if remaining > 0:
-            self.delta[self.delta_snap:self.delta_snap + remaining] = \
-                self.delta[start:self.delta_len]
-        self.delta_len = self.delta_snap + remaining
-        absorbed_docs = self._count_docs_within(self.delta_snap)
-        self.delta_doc_lens = (self.delta_doc_lens[:absorbed_docs]
-                               + self.delta_doc_lens[
-                                   absorbed_docs + docs_dropped:])
+            self.delta[:remaining] = self.delta[acc:self.delta_len].clone()
+        self.delta_len = remaining
+        self.delta_len_t.fill_(remaining)
+        self.delta_doc_lens = self.delta_doc_lens[docs_dropped:]
 
     # ------------------------------------------------------------------
     # rebuild
     # ------------------------------------------------------------------
     def maybe_rebuild(self) -> None:
-        """Kick off a rebuild when pending delta grew past threshold."""
+        """Kick off a rebuild when the delta grew past the threshold."""
+        self.poll_rebuild()
         if self._rebuild_event is not None or self.delta_len == 0:
             return
-        pending = self.delta_len - self.delta_snap
-        if pending < self.rebuild_threshold:
+        if self.delta_len < self.rebuild_threshold:
             return
         self._launch_rebuild()
 
-    def _launch_rebuild(self, force: bool = False) -> None:
+    def _launch_rebuild(self) -> None:
+        if self._rebuild_event is not None:
+            return
         # Evict oldest whole docs until the snapshot fits into capacity.
         keep_start = 0
         for ln in self.active_doc_lens:
@@ -153,6 +157,7 @@ class GlobalIndex:
             return
 
         dst = self.staging_corpus
+        dst.fill_(PAD_TOKEN)
         if n_active_keep > 0:
             dst[:n_active_keep].copy_(
                 self.corpus[keep_start:self.active_len])
@@ -171,20 +176,39 @@ class GlobalIndex:
             if acc <= snap:
                 new_doc_lens.append(ln)
 
-        if (self.device.type == "cuda" and self.rebuild_stream is not None
-                and not force):
+        # Staging owns a copy of the snapshot; compact it out of the
+        # delta right away so appends always see the full capacity.
+        docs_absorbed = self._count_docs_within(snap)
+        remaining = self.delta_len - snap
+        if remaining > 0:
+            self.delta[:remaining] = self.delta[snap:self.delta_len].clone()
+        self.delta_len = remaining
+        self.delta_len_t.fill_(remaining)
+        self.delta_doc_lens = self.delta_doc_lens[docs_absorbed:]
+
+        # Build over the real prefix plus one sentinel column so the
+        # build-time suffix order matches query-time comparisons.
+        m = min(n_new + 1, self.capacity)
+        if self.device.type == "cuda" and self.rebuild_stream is not None:
             self.rebuild_stream.wait_stream(
                 torch.cuda.current_stream(self.device))
             with torch.cuda.stream(self.rebuild_stream):
-                self.staging_sa[:n_new] = build_suffix_array(dst[:n_new])
+                self._build_staging_sa(dst, m)
             event = torch.cuda.Event()
             event.record(self.rebuild_stream)
-            self._pending = (n_new, new_doc_lens, snap)
+            self._pending = (n_new, new_doc_lens)
             self._rebuild_event = event
-            self.delta_snap = snap
         else:
-            self.staging_sa[:n_new] = build_suffix_array(dst[:n_new])
-            self._finish_swap(n_new, new_doc_lens, snap)
+            self._build_staging_sa(dst, m)
+            self._finish_swap(n_new, new_doc_lens)
+
+    def _build_staging_sa(self, dst: torch.Tensor, m: int) -> None:
+        self.staging_sa[:m] = build_suffix_array(dst[:m])
+        if m < self.capacity:
+            # All-sentinel suffixes compare greater than any real
+            # pattern, so any internal order is valid for search.
+            self.staging_sa[m:] = torch.arange(
+                m, self.capacity, dtype=torch.int64, device=self.device)
 
     def _count_docs_within(self, tokens: int) -> int:
         acc = 0
@@ -196,20 +220,12 @@ class GlobalIndex:
             count += 1
         return count
 
-    def _finish_swap(self, n_new: int, new_doc_lens: deque[int],
-                     snap: int) -> None:
+    def _finish_swap(self, n_new: int, new_doc_lens: deque[int]) -> None:
         (self.corpus, self.staging_corpus) = (self.staging_corpus,
                                               self.corpus)
         (self.sa, self.staging_sa) = (self.staging_sa, self.sa)
         self.active_len = n_new
         self.active_doc_lens = new_doc_lens
-        remaining = self.delta_len - snap
-        if remaining > 0:
-            self.delta[:remaining] = self.delta[snap:self.delta_len]
-        self.delta_len = remaining
-        docs_absorbed = self._count_docs_within(snap)
-        self.delta_doc_lens = self.delta_doc_lens[docs_absorbed:]
-        self.delta_snap = 0
         self._rebuild_event = None
         self._pending = None
 
@@ -218,8 +234,8 @@ class GlobalIndex:
         if self._rebuild_event is None:
             return
         if self._rebuild_event.query():
-            n_new, new_doc_lens, snap = self._pending
-            self._finish_swap(n_new, new_doc_lens, snap)
+            n_new, new_doc_lens = self._pending
+            self._finish_swap(n_new, new_doc_lens)
 
     # ------------------------------------------------------------------
     # queries
@@ -232,6 +248,11 @@ class GlobalIndex:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Longest-suffix match against corpus + delta.
 
+        Pure tensor ops (compile-safe): callers on the host side are
+        responsible for calling poll_rebuild() to swap in finished
+        rebuilds; the write paths (append_documents/maybe_rebuild)
+        already do.
+
         Args:
             query: [B, P] int32 padded query tails.
             query_len: [B] int64 valid lengths.
@@ -242,56 +263,52 @@ class GlobalIndex:
              occ_count [B] i64). Occurrences come from either the SA or
             the delta, whichever matched longer (ties prefer the SA).
         """
-        self.poll_rebuild()
         b = query.shape[0]
         r = self.max_occurrences
         device = self.device
-        match_len = torch.zeros(b, dtype=torch.int64, device=device)
-        cont = torch.full((b, r, self.k), -1, dtype=torch.int32,
-                          device=device)
-        occ_count = torch.zeros(b, dtype=torch.int64, device=device)
 
-        if self.active_len > 0:
-            sa_len, sa_start, sa_end = longest_suffix_match(
-                self.sa[:self.active_len], self.corpus[:self.active_len],
-                query, query_len, max_len)
-        else:
-            sa_len = torch.zeros_like(match_len)
-            sa_start = sa_end = sa_len
+        sa_len, sa_start, sa_end = longest_suffix_match(
+            self.sa, self.corpus, query, query_len, max_len)
         d_len, d_pos, d_cnt = self._delta_match(query, query_len, max_len)
 
         use_sa = (sa_len >= d_len) & (sa_len > 0)
         use_delta = (d_len > sa_len) & (d_len > 0)
+        zero = torch.zeros(b, dtype=torch.int64, device=device)
         match_len = torch.where(use_sa, sa_len,
-                                torch.where(use_delta, d_len, match_len))
+                                torch.where(use_delta, d_len, zero))
 
+        # Sample the SA interval: sequential when it fits, strided
+        # otherwise (the interval is ordered by continuation, so taking
+        # a prefix would bias the vote toward small token ids).
         offs = torch.arange(r, dtype=torch.int64, device=device)
-        if self.active_len > 0:
-            take = (sa_start.unsqueeze(1) + offs) < sa_end.unsqueeze(1)
-            sa_idx = (sa_start.unsqueeze(1) + offs).clamp(
-                min=0, max=self.active_len - 1)
-            pos = self.sa[:self.active_len][sa_idx.reshape(-1)].reshape(b, r)
-            sa_occ = torch.where(take, pos, 0)
-            sa_cnt = torch.minimum(sa_end - sa_start,
-                                   torch.full_like(sa_end, r))
-            sa_cont = self._gather_cont(self.corpus, self.active_len,
-                                        sa_occ, sa_cnt, match_len, use_sa)
-            cont = torch.where(use_sa.unsqueeze(1).unsqueeze(2), sa_cont,
-                               cont)
-            occ_count = torch.where(use_sa, sa_cnt, occ_count)
+        ilen = sa_end - sa_start
+        strided = sa_start.unsqueeze(1) + (offs.unsqueeze(0)
+                                           * ilen.unsqueeze(1)) // r
+        seq = sa_start.unsqueeze(1) + offs.unsqueeze(0)
+        sa_idx = torch.where((ilen > r).unsqueeze(1), strided, seq).clamp(
+            0, self.capacity - 1)
+        sa_cnt = torch.minimum(ilen, torch.full_like(ilen, r))
+        take = offs.unsqueeze(0) < sa_cnt.unsqueeze(1)
+        pos = self.sa[sa_idx.reshape(-1)].reshape(b, r)
+        sa_occ = torch.where(take, pos, 0)
+        sa_cont = self._gather_cont(self.corpus, self.capacity, sa_occ,
+                                    sa_cnt, match_len, use_sa)
+        d_cont = self._gather_cont(self.delta, self.delta_len_t, d_pos,
+                                   d_cnt, match_len, use_delta)
 
-        if self.delta_len > 0:
-            d_cont = self._gather_cont(self.delta, self.delta_len, d_pos,
-                                       d_cnt, match_len, use_delta)
-            cont = torch.where(use_delta.unsqueeze(1).unsqueeze(2), d_cont,
-                               cont)
-            occ_count = torch.where(use_delta, d_cnt, occ_count)
+        cont = torch.full((b, r, self.k), -1, dtype=torch.int32,
+                          device=device)
+        cont = torch.where(use_sa.unsqueeze(1).unsqueeze(2), sa_cont, cont)
+        cont = torch.where(use_delta.unsqueeze(1).unsqueeze(2), d_cont,
+                           cont)
+        occ_count = torch.where(use_sa, sa_cnt,
+                                torch.where(use_delta, d_cnt, zero))
         return match_len, cont, occ_count
 
     def _gather_cont(
         self,
         src: torch.Tensor,
-        src_len: int,
+        src_len: int | torch.Tensor,
         occ_pos: torch.Tensor,
         occ_cnt: torch.Tensor,
         match_len: torch.Tensor,
@@ -299,14 +316,15 @@ class GlobalIndex:
     ) -> torch.Tensor:
         """Gather k-token continuations after occurrences in src."""
         b, r = occ_pos.shape
+        n = src.shape[0]
         row = torch.arange(r, device=self.device).unsqueeze(0)
         row_active = (row < occ_cnt.unsqueeze(1)) & sel.unsqueeze(1)
         idx = (occ_pos.unsqueeze(2) + match_len.unsqueeze(1).unsqueeze(2)
                + torch.arange(self.k, device=self.device))
         valid = row_active.unsqueeze(2) & (idx < src_len) & (idx >= 0)
-        vals = src[idx.clamp(0, src_len - 1).reshape(b, r * self.k)
+        vals = src[idx.clamp(0, n - 1).reshape(b, r * self.k)
                    ].reshape(b, r, self.k)
-        return torch.where(valid, vals, -1)
+        return torch.where(valid & (vals != PAD_TOKEN), vals, -1)
 
     def _delta_match(
         self,
@@ -314,73 +332,60 @@ class GlobalIndex:
         query_len: torch.Tensor,
         max_len: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Seed-and-verify longest match within the delta buffer.
+        """Longest match within the delta buffer, fully verified.
 
-        Returns (match_len [B], positions [B, C], count [B]).
+        Every window position is checked by a rolling AND over pattern
+        offsets (no seed sampling), so counts and the binary-search
+        predicate are exact. Returns (match_len [B], positions [B, C]
+        compacted left in position order, count [B] clamped to C).
         """
         b = query.shape[0]
         c = self.max_occurrences
         device = self.device
-        dlen = self.delta_len
-        zero = torch.zeros(b, dtype=torch.int64, device=device)
-        if dlen == 0:
-            return (zero, zero.unsqueeze(1).expand(b, c).contiguous(),
-                    zero.clone())
-        pos_all = torch.arange(dlen, dtype=torch.int64, device=device)
+        cap = self.delta_capacity
+        q = query.shape[1]
+        padded = torch.cat([
+            self.delta,
+            torch.full((max_len,), -1, dtype=torch.int32, device=device)])
+        pos_all = torch.arange(cap, dtype=torch.int64, device=device)
         offs = torch.arange(max_len, dtype=torch.int64, device=device)
-        delta_active = self.delta[:dlen]
 
-        def verify(length: torch.Tensor) -> tuple[torch.Tensor,
-                                                  torch.Tensor]:
+        def match_mask(length: torch.Tensor) -> torch.Tensor:
+            m = (pos_all.unsqueeze(0) + length.unsqueeze(1)
+                 <= self.delta_len_t)
+            m &= ((length > 0) & (query_len >= length)).unsqueeze(1)
             pat_idx = (query_len.unsqueeze(1) - length.unsqueeze(1)
-                       + offs.unsqueeze(0))
-            pat_valid = offs.unsqueeze(0) < length.unsqueeze(1)
-            pat = torch.where(
-                pat_valid,
-                query.gather(1, pat_idx.clamp(0, query.shape[1] - 1)), 0)
-            seed = delta_active.unsqueeze(0) == pat[:, :1]
-            seed &= ((pos_all.unsqueeze(0) + length.unsqueeze(1) - 1 < dlen)
-                     & (query_len >= length).unsqueeze(1))
-            key = pos_all.unsqueeze(0) + (~seed).to(torch.int64) * (dlen + 1)
-            order = torch.argsort(key, dim=1)
-            width = min(dlen, c)
-            cand = pos_all.unsqueeze(0).expand(b, dlen).gather(
-                1, order[:, :width])
-            if width < c:
-                cand = torch.cat([
-                    cand, torch.zeros(b, c - width, dtype=torch.int64,
-                                      device=device)], dim=1)
-            cand_active = seed.gather(1, cand.clamp(0, dlen - 1))
-            idx = cand.unsqueeze(2) + offs.unsqueeze(0).unsqueeze(0)
-            valid = (idx < dlen) & pat_valid.unsqueeze(1)
-            toks = delta_active[idx.clamp(0, dlen - 1)]
-            full = ((toks == pat.unsqueeze(1)) | ~valid).all(dim=2)
-            ok = cand_active & full
-            cnt = ok.sum(dim=1)
-            pos_out = torch.where(ok, cand, 0)
-            return cnt, pos_out
+                       + offs.unsqueeze(0)).clamp(0, q - 1)
+            pat = query.gather(1, pat_idx)
+            for j in range(max_len):
+                need = length > j
+                m &= ((padded[j:j + cap].unsqueeze(0) == pat[:, j:j + 1])
+                      | ~need.unsqueeze(1))
+            return m
 
-        hi0 = min(max_len, dlen)
-        lo, hi = zero.clone(), torch.full(
-            (b,), hi0, dtype=torch.int64, device=device)
-        iters = max(1, math.ceil(math.log2(hi0 + 1)))
-        pos_keep = torch.zeros(b, c, dtype=torch.int64, device=device)
-        cnt_keep = zero.clone()
+        lo = torch.zeros(b, dtype=torch.int64, device=device)
+        hi = torch.full((b,), max_len, dtype=torch.int64, device=device)
+        iters = max(1, math.ceil(math.log2(max_len + 1)))
         for _ in range(iters):
             mid = (lo + hi + 1) // 2
-            cnt, pos_out = verify(mid)
-            pred = (cnt > 0) & (mid > 0)
-            lo = torch.where(pred, mid, lo)
-            hi = torch.where(pred, hi, mid - 1)
-            pos_keep = torch.where(pred.unsqueeze(1), pos_out, pos_keep)
-            cnt_keep = torch.where(pred, cnt, cnt_keep)
-        cnt, pos_out = verify(lo)
-        final_ok = lo > 0
-        pos_out = torch.where(final_ok.unsqueeze(1), pos_out, pos_keep)
-        cnt = torch.where(final_ok, cnt, cnt_keep)
-        return lo, pos_out, torch.minimum(cnt, torch.full_like(cnt, c))
+            found = match_mask(mid).any(dim=1)
+            lo = torch.where(found, mid, lo)
+            hi = torch.where(found, hi, mid - 1)
 
-    def expand(self, cont: torch.Tensor,
-               occ_count: torch.Tensor) -> tuple[torch.Tensor,
-                                                  torch.Tensor]:
-        return expand_chain(cont, occ_count, self.k)
+        mask = match_mask(lo)
+        cnt = mask.sum(dim=1)
+        key = pos_all.unsqueeze(0) + (~mask).to(torch.int64) * (cap + 1)
+        width = min(c, cap)
+        top = torch.topk(key, width, dim=1, largest=False).values
+        occ = torch.where(top <= cap - 1, top, torch.zeros_like(top))
+        if width < c:
+            occ = torch.cat([
+                occ, torch.zeros(b, c - width, dtype=torch.int64,
+                                 device=device)], dim=1)
+        return lo, occ, torch.minimum(cnt, torch.full_like(cnt, c))
+
+    def expand(self, cont: torch.Tensor, occ_count: torch.Tensor,
+               min_token_prob: float = 0.0) -> tuple[torch.Tensor,
+                                                     torch.Tensor]:
+        return expand_chain(cont, occ_count, self.k,
+                            min_token_prob=min_token_prob)
