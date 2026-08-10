@@ -57,6 +57,7 @@ class SuffixGPUDrafter:
             min_token_prob=min_token_prob,
         ).to(self.device)
         self.global_index: GlobalIndex | None = None
+        self._ingested: dict = {}
         if enable_global:
             self.global_index = GlobalIndex(
                 capacity=global_capacity,
@@ -102,6 +103,83 @@ class SuffixGPUDrafter:
         """
         if self.global_index is not None:
             self.global_index.poll_rebuild()
+
+    def update_state(
+        self,
+        num_tokens_no_spec: torch.Tensor,
+        token_ids_gpu: torch.Tensor,
+        sampled_token_ids: torch.Tensor,
+        valid_sampled_tokens_count: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Device-side batch state update (async-scheduling glue).
+
+        Scatters the previous step's sampled token ids (still on
+        device; -1 padded) into the resident token buffer and returns
+        the updated per-request token counts. No host synchronization.
+
+        Args:
+            num_tokens_no_spec: [B] int32/int64 committed counts
+                (pre-update).
+            token_ids_gpu: [B, S] int32 resident buffer, updated
+                in place.
+            sampled_token_ids: [B, T] int32 last-step sampled ids,
+                -1 beyond each row's accepted count.
+            valid_sampled_tokens_count: optional [B] number of valid
+                ids per row; derived from ``!= -1`` when omitted.
+
+        Returns:
+            [B] int32 updated token counts (also usable as the next
+            ``num_tokens_no_spec``).
+        """
+        b, s = token_ids_gpu.shape
+        t = sampled_token_ids.shape[1]
+        base = num_tokens_no_spec.to(torch.int64)
+        if valid_sampled_tokens_count is None:
+            valid_sampled_tokens_count = (
+                sampled_token_ids != -1).sum(dim=1)
+        cnt = valid_sampled_tokens_count.to(torch.int64)
+        # One column per iteration: clamped out-of-range positions would
+        # collide across columns in a single scatter and race.
+        for j in range(t):
+            pos_j = (base + j).clamp(max=s - 1).unsqueeze(1)
+            ok_j = ((j < cnt) & (sampled_token_ids[:, j] != -1)
+                    & (base + j < s)).unsqueeze(1)
+            old_j = token_ids_gpu.gather(1, pos_j)
+            val_j = torch.where(
+                ok_j, sampled_token_ids[:, j:j + 1].to(
+                    token_ids_gpu.dtype), old_j)
+            token_ids_gpu.scatter_(1, pos_j, val_j)
+        return (base + cnt).to(torch.int32)
+
+    def propose_with_update(
+        self,
+        num_tokens_no_spec: torch.Tensor,
+        token_ids_gpu: torch.Tensor,
+        sampled_token_ids: torch.Tensor,
+        valid_sampled_tokens_count: torch.Tensor | None = None,
+        max_model_len: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """update_state + eligibility mask + propose, all on device.
+
+        Rows draft only when they accepted at least one token last step
+        (mirrors the partial-prefill skip) and still have room.
+
+        Returns:
+            (draft_tokens [B, k] int32, num_valid [B] int32,
+             new_num_tokens [B] int32)
+        """
+        if valid_sampled_tokens_count is None:
+            valid_sampled_tokens_count = (
+                sampled_token_ids != -1).sum(dim=1)
+        new_counts = self.update_state(
+            num_tokens_no_spec, token_ids_gpu, sampled_token_ids,
+            valid_sampled_tokens_count)
+        mask = valid_sampled_tokens_count.to(torch.int64) > 0
+        limit = token_ids_gpu.shape[1] if max_model_len is None else \
+            min(max_model_len, token_ids_gpu.shape[1])
+        mask &= new_counts.to(torch.int64) < limit
+        draft, num_valid = self.propose(new_counts, token_ids_gpu, mask)
+        return draft, num_valid, new_counts
 
     def propose(
         self,
@@ -178,6 +256,44 @@ class SuffixGPUDrafter:
         if self.global_index is None or not rows:
             return
         docs = [row[:ln] for row, ln in zip(rows, lengths) if ln > 0]
+        if docs:
+            self.global_index.append_documents(docs)
+
+    def ingest_active(
+        self,
+        keys: list,
+        rows: list[torch.Tensor],
+        lengths: list[int],
+        final: bool = False,
+        chunk: int = 64,
+    ) -> None:
+        """Incrementally ingest in-flight responses (host-side).
+
+        Cross-request sharing should not wait for request finish (the
+        CPU suffix cache ingests responses immediately). Responses are
+        fed to the global index in chunks; consecutive chunks overlap
+        by max_pattern_len + k tokens so patterns and continuations
+        spanning a chunk boundary stay findable.
+
+        Args:
+            keys: stable per-request identifiers.
+            rows: response-only token rows (device tensors).
+            lengths: current response lengths (host ints).
+            final: flush remaining tail and forget the request.
+            chunk: minimum new tokens before a chunk is emitted.
+        """
+        if self.global_index is None:
+            return
+        overlap = self.max_pattern_len + self.k
+        docs = []
+        for key, row, ln in zip(keys, rows, lengths):
+            done = self._ingested.get(key, 0)
+            if ln - done >= chunk or (final and ln > done):
+                start = max(0, done - overlap)
+                docs.append(row[start:ln])
+                self._ingested[key] = ln
+            if final:
+                self._ingested.pop(key, None)
         if docs:
             self.global_index.append_documents(docs)
 
