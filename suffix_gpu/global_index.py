@@ -22,7 +22,6 @@ Design (phase 2):
 
 from __future__ import annotations
 
-import math
 from collections import deque
 
 import torch
@@ -347,50 +346,54 @@ class GlobalIndex:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Longest match within the delta buffer, fully verified.
 
-        Every window position is checked by a rolling AND over pattern
-        offsets (no seed sampling), so counts and the binary-search
-        predicate are exact. Returns (match_len [B], positions [B, C]
-        compacted left in position order, count [B] clamped to C).
+        One pass computes match_back[i]: the longest common suffix of
+        the delta tokens ending at i (exclusive) and each query tail.
+        A window of length L starting at pos matches iff
+        match_back[pos + L] >= L, so the longest match is a single max.
+        Returns (match_len [B], positions [B, C] compacted left in
+        position order, count [B] clamped to C).
         """
         b = query.shape[0]
         c = self.max_occurrences
         device = self.device
         cap = self.delta_capacity
         q = query.shape[1]
-        padded = torch.cat([
-            self.delta,
-            torch.full((max_len,), -1, dtype=torch.int32, device=device)])
-        pos_all = torch.arange(cap, dtype=torch.int64, device=device)
+        n_i = cap + 1
+
+        # Query tail, newest-first; slots past the query length get -3,
+        # which never equals delta content (tokens >= 0, SEP -2, left
+        # pad -1), so match lengths are capped at query_len.
         offs = torch.arange(max_len, dtype=torch.int64, device=device)
+        pat_idx = query_len.unsqueeze(1) - 1 - offs.unsqueeze(0)
+        pat = torch.where(
+            pat_idx >= 0,
+            query.gather(1, pat_idx.clamp(min=0, max=q - 1)),
+            torch.full((1, 1), -3, dtype=query.dtype, device=device))
 
-        def match_mask(length: torch.Tensor) -> torch.Tensor:
-            m = (pos_all.unsqueeze(0) + length.unsqueeze(1)
-                 <= self.delta_len_t)
-            m &= ((length > 0) & (query_len >= length)).unsqueeze(1)
-            pat_idx = (query_len.unsqueeze(1) - length.unsqueeze(1)
-                       + offs.unsqueeze(0)).clamp(0, q - 1)
-            pat = query.gather(1, pat_idx)
-            for j in range(max_len):
-                need = length > j
-                m &= ((padded[j:j + cap].unsqueeze(0) == pat[:, j:j + 1])
-                      | ~need.unsqueeze(1))
-            return m
+        lp = torch.cat([
+            torch.full((max_len,), -1, dtype=self.delta.dtype,
+                       device=device), self.delta])
+        acc = torch.ones(b, n_i, dtype=torch.bool, device=device)
+        mb16 = torch.zeros(b, n_i, dtype=torch.int16, device=device)
+        one = torch.ones((), dtype=torch.int16, device=device)
+        for t in range(max_len):
+            seg = lp[max_len - 1 - t:max_len - 1 - t + n_i]
+            acc = acc & (seg.unsqueeze(0) == pat[:, t:t + 1])
+            mb16 = mb16 + acc * one
+        mb = mb16.to(torch.int64)
+        pos_i = torch.arange(n_i, dtype=torch.int64, device=device)
+        # Window [i - L, i) must lie inside the committed delta region.
+        valid_i = pos_i.unsqueeze(0) <= self.delta_len_t
+        mb = torch.where(valid_i, mb, torch.zeros_like(mb))
 
-        lo = torch.zeros(b, dtype=torch.int64, device=device)
-        hi = torch.full((b,), max_len, dtype=torch.int64, device=device)
-        iters = max(1, math.ceil(math.log2(max_len + 1)))
-        for _ in range(iters):
-            mid = (lo + hi + 1) // 2
-            found = match_mask(mid).any(dim=1)
-            lo = torch.where(found, mid, lo)
-            hi = torch.where(found, hi, mid - 1)
-
-        mask = match_mask(lo)
+        lo = mb.max(dim=1).values
+        mask = valid_i & (mb >= lo.unsqueeze(1)) & (lo > 0).unsqueeze(1)
         cnt = mask.sum(dim=1)
-        key = pos_all.unsqueeze(0) + (~mask).to(torch.int64) * (cap + 1)
-        width = min(c, cap)
+        key = pos_i.unsqueeze(0) + (~mask).to(torch.int64) * (n_i + 1)
+        width = min(c, n_i)
         top = torch.topk(key, width, dim=1, largest=False).values
-        occ = torch.where(top <= cap - 1, top, torch.zeros_like(top))
+        occ_end = torch.where(top <= n_i - 1, top, torch.zeros_like(top))
+        occ = (occ_end - lo.unsqueeze(1)).clamp(min=0)
         if width < c:
             occ = torch.cat([
                 occ, torch.zeros(b, c - width, dtype=torch.int64,
