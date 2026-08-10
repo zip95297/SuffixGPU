@@ -121,27 +121,39 @@ def sim_gpu(
     prompt_len: int,
     device: torch.device,
     name: str,
+    ingest_chunk: int = 64,
 ) -> SimResult:
     b = len(streams)
     total = max(len(s) for s in streams)
-    s_buf = total + 8
+    k = drafter.k
+    s_buf = total + k + 8
     buf = torch.zeros((b, s_buf), dtype=torch.int32, device=device)
     for i, st in enumerate(streams):
         buf[i, :prompt_len] = torch.from_numpy(st[:prompt_len]).to(
             device, torch.int32)
     lens = np.full(b, prompt_len, dtype=np.int64)
-    finished = np.zeros(b, dtype=bool)
     res = SimResult(name)
 
-    num_tok_t = torch.zeros(b, dtype=torch.int32, device=device)
-    while not finished.all():
-        num_tok_t.copy_(torch.from_numpy(lens.astype(np.int32)))
-        mask_t = torch.from_numpy(~finished).to(device)
+    # Prefill's sampled token primes the first decode step.
+    pending: list[list[int]] = [[int(st[prompt_len])] for st in streams]
+    finished = np.zeros(b, dtype=bool)
+    flushed = np.zeros(b, dtype=bool)
+    num_tok_t = torch.from_numpy(lens.astype(np.int32)).to(device)
+    sampled_buf = torch.full((b, k + 1), -1, dtype=torch.int32,
+                             device=device)
+
+    while not (finished & (np.array([len(p) for p in pending]) == 0)).all():
+        sampled_np = np.full((b, k + 1), -1, dtype=np.int32)
+        for i in range(b):
+            if pending[i]:
+                sampled_np[i, :len(pending[i])] = pending[i]
+        sampled_buf.copy_(torch.from_numpy(sampled_np))
         drafter.poll()
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         t0 = time.perf_counter()
-        draft_t, nv_t = drafter.propose(num_tok_t, buf, mask_t)
+        draft_t, nv_t, num_tok_t = drafter.propose_with_update(
+            num_tok_t, buf, sampled_buf)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         res.step_ms.append((time.perf_counter() - t0) * 1e3)
@@ -149,30 +161,42 @@ def sim_gpu(
         draft = draft_t.cpu().numpy()
         nv = nv_t.cpu().numpy()
         res.steps += 1
-        newly_finished = []
         for i in range(b):
-            if finished[i]:
+            committed_now = len(pending[i])
+            if committed_now == 0:
                 continue
             res.req_steps += 1
+            lens[i] += committed_now
+            res.committed += committed_now
+            pending[i] = []
             ref = streams[i]
             pos = int(lens[i])
             remain = len(ref) - pos
+            if remain <= 0:
+                finished[i] = True
+                continue
             d = [int(t) for t in draft[i, :nv[i]]]
             a = accept_len(d, ref[pos:])
-            commit = min(a + 1, remain)
             res.drafted += len(d)
             res.accepted += min(a, max(0, remain - 1))
-            buf[i, pos:pos + commit] = torch.from_numpy(
-                ref[pos:pos + commit]).to(device, torch.int32)
-            lens[i] += commit
-            res.committed += commit
-            if lens[i] >= len(ref):
-                finished[i] = True
-                newly_finished.append(i)
-        if drafter.global_index is not None and newly_finished:
-            rows = [buf[i, prompt_len:int(lens[i])] for i in newly_finished]
-            lengths = [int(lens[i]) - prompt_len for i in newly_finished]
-            drafter.harvest_rows(rows, lengths)
+            commit = min(a + 1, remain)
+            pending[i] = [int(t) for t in ref[pos:pos + commit]]
+        # In-flight ingestion (host-side, off the propose path).
+        act = [i for i in range(b) if not flushed[i]]
+        keys = [f"{name}-{i}" for i in act]
+        rows = [buf[i, prompt_len:int(lens[i])] for i in act]
+        lengths = [int(lens[i]) - prompt_len for i in act]
+        fin = [i for i in act if finished[i] and not pending[i]]
+        if act:
+            drafter.ingest_active(keys, rows, lengths, chunk=ingest_chunk)
+        if fin:
+            drafter.ingest_active(
+                [f"{name}-{i}" for i in fin],
+                [buf[i, prompt_len:int(lens[i])] for i in fin],
+                [int(lens[i]) - prompt_len for i in fin],
+                final=True, chunk=ingest_chunk)
+            for i in fin:
+                flushed[i] = True
     return res
 
 
