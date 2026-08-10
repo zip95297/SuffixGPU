@@ -16,7 +16,8 @@ def build_suffix_array(tokens: torch.Tensor) -> torch.Tensor:
     """Build the suffix array of a 1-D token sequence.
 
     Args:
-        tokens: 1-D tensor of token ids (any int dtype, values >= 0).
+        tokens: 1-D tensor of token ids (any int dtype; negative
+            sentinel values are allowed).
 
     Returns:
         1-D int64 tensor ``sa`` where ``sa[i]`` is the start position of
@@ -32,8 +33,11 @@ def build_suffix_array(tokens: torch.Tensor) -> torch.Tensor:
     if n == 1:
         return torch.zeros(1, dtype=torch.int64, device=device)
 
-    # rank[i] = rank of the length-1 prefix (the token itself).
-    rank = tokens.to(torch.int64)
+    # Dense initial ranks: raw token values can exceed base (PAD
+    # sentinels) or be negative (SEP), which would corrupt the packed
+    # (rank, second) key below. unique() maps them to [0, n) while
+    # preserving order.
+    rank = torch.unique(tokens.to(torch.int64), return_inverse=True)[1]
     base = int(n) + 1
     sa = torch.argsort(rank)
     k = 1
