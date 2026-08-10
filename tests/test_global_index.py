@@ -14,8 +14,14 @@ R = 8
 P = 8
 
 
-def _naive_chain(corpus: list[int], query: list[int], k: int,
+def _naive_chain(docs, query: list[int], k: int,
                  max_len: int) -> tuple[list[int], int]:
+    if docs and isinstance(docs[0], int):
+        docs = [docs]
+    corpus: list[int] = []
+    for d in docs:
+        corpus.extend(d)
+        corpus.append(-2)  # SEP_TOKEN: blocks cross-doc matches
     length = naive_longest_suffix_match(corpus, query, max_len)
     if length == 0:
         return [], 0
@@ -23,7 +29,8 @@ def _naive_chain(corpus: list[int], query: list[int], k: int,
     chain: list[int] = []
     for _ in range(k):
         toks = [corpus[s + length + len(chain)] for s in active
-                if s + length + len(chain) < len(corpus)]
+                if s + length + len(chain) < len(corpus)
+                and corpus[s + length + len(chain)] >= 0]
         if not toks:
             break
         cnt = Counter(toks)
@@ -69,7 +76,7 @@ def test_sa_path_after_rebuild(device):
                       device=device)
     doc = [5, 6, 7, 8, 9, 5, 6, 7, 8, 10]
     _append(idx, [doc], device)
-    assert idx.active_len == len(doc)
+    assert idx.active_len == len(doc) + 1  # + SEP
     assert idx.delta_len == 0
     chain, mlen, occ = _query(idx, [5, 6, 7, 8], device)
     exp_chain, exp_len = _naive_chain(doc, [5, 6, 7, 8], K, P)
@@ -81,7 +88,6 @@ def test_sa_path_after_rebuild(device):
 def test_delta_sa_consistency(device):
     doc1 = [1, 2, 3, 4, 1, 2, 3, 9]
     doc2 = [7, 1, 2, 3, 4, 8, 1, 2]
-    corpus = doc1 + doc2
     q_before = GlobalIndex(capacity=1024, delta_capacity=256, k=K,
                            max_occurrences=R, rebuild_threshold=100000,
                            device=device)
@@ -94,7 +100,7 @@ def test_delta_sa_consistency(device):
     r_after = _query(q_after, [1, 2, 3, 4], device)
     assert r_before[1] == r_after[1]
     assert r_before[0] == r_after[0]
-    exp_chain, exp_len = _naive_chain(corpus, [1, 2, 3, 4], K, P)
+    exp_chain, exp_len = _naive_chain([doc1, doc2], [1, 2, 3, 4], K, P)
     assert r_after[1] == exp_len
     assert r_after[0] == exp_chain
 
@@ -106,10 +112,9 @@ def test_multiple_rebuilds(device):
     docs = [[1, 1, 2], [1, 1, 3], [1, 1, 4], [1, 1, 5]]
     for d in docs:
         _append(idx, [d], device)
-    corpus = [t for d in docs for t in d]
-    assert idx.active_len == len(corpus)
+    assert idx.active_len == sum(len(d) + 1 for d in docs)
     chain, mlen, occ = _query(idx, [1, 1], device)
-    exp_chain, exp_len = _naive_chain(corpus, [1, 1], K, P)
+    exp_chain, exp_len = _naive_chain(docs, [1, 1], K, P)
     assert mlen == exp_len
     assert chain == exp_chain
 
@@ -216,7 +221,7 @@ class _NeverDoneEvent:
 def test_delta_overflow_with_rebuild_in_flight(device):
     """Regression (P0-3): appends that overflow the delta while a
     rebuild is in flight must drop oldest docs, not crash copy_."""
-    idx = GlobalIndex(capacity=64, delta_capacity=16, k=K,
+    idx = GlobalIndex(capacity=64, delta_capacity=18, k=K,
                       max_occurrences=R, rebuild_threshold=100000,
                       device=device)
     _append(idx, [[1] * 6, [2] * 6], device)
@@ -241,9 +246,29 @@ def test_delta_overflow_sync_rebuild(device):
                       device=device)
     _append(idx, [[1] * 12], device)
     _append(idx, [[2] * 12], device)
-    assert idx.active_len == 12
-    assert idx.delta_len == 12
+    assert idx.active_len == 13  # doc + SEP
+    assert idx.delta_len == 13
     _, mlen_sa, _ = _query(idx, [1, 1], device)
     assert mlen_sa == 2
     _, mlen_delta, _ = _query(idx, [2, 2], device)
     assert mlen_delta == 2
+
+
+def test_no_cross_document_match(device):
+    """Regression: matches and continuations must not span documents."""
+    doc1 = [1, 2, 3, 7, 8, 9]
+    doc2 = [100, 101, 102, 55, 56]
+    for threshold in (100000, 1):  # delta path, then SA path
+        idx = GlobalIndex(capacity=256, delta_capacity=64, k=K,
+                          max_occurrences=R, rebuild_threshold=threshold,
+                          device=device)
+        _append(idx, [doc1, doc2], device)
+        # Tail of doc1 matches, but its continuation is the doc boundary:
+        # nothing may be drafted from the head of doc2.
+        chain, mlen, occ = _query(idx, [7, 8, 9], device)
+        assert mlen == 3
+        assert occ == 1
+        assert chain == []
+        # A pattern spanning the boundary must not match at all.
+        chain, mlen, occ = _query(idx, [8, 9, 100], device)
+        assert (mlen, occ, chain) == (1, 1, [101, 102, 55, 56])

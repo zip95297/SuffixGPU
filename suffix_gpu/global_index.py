@@ -32,6 +32,10 @@ from suffix_gpu.sa_search import longest_suffix_match
 from suffix_gpu.suffix_array import build_suffix_array
 
 PAD_TOKEN = torch.iinfo(torch.int32).max
+# Written between documents. Negative, so it can never equal a query
+# token (real ids are >= 0): matches and continuations cannot cross
+# document boundaries.
+SEP_TOKEN = -2
 
 
 class GlobalIndex:
@@ -78,21 +82,27 @@ class GlobalIndex:
     # writes
     # ------------------------------------------------------------------
     def append_documents(self, docs: list[torch.Tensor]) -> None:
-        """Append finished-response token tensors to the delta."""
+        """Append finished-response token tensors to the delta.
+
+        Each document is followed by one SEP_TOKEN, so matches and
+        continuations never span document boundaries. Recorded doc
+        lengths include the separator.
+        """
         for doc in docs:
             doc = doc.to(self.device).to(torch.int32).reshape(-1)
             n = doc.shape[0]
             if n == 0:
                 continue
-            if n > self.delta_capacity:
-                doc = doc[-self.delta_capacity:]
-                n = self.delta_capacity
-            if self.delta_len + n > self.delta_capacity:
-                self._make_room(n)
+            if n + 1 > self.delta_capacity:
+                doc = doc[-(self.delta_capacity - 1):]
+                n = doc.shape[0]
+            if self.delta_len + n + 1 > self.delta_capacity:
+                self._make_room(n + 1)
             self.delta[self.delta_len:self.delta_len + n].copy_(doc)
-            self.delta_len += n
+            self.delta[self.delta_len + n] = SEP_TOKEN
+            self.delta_len += n + 1
             self.delta_len_t.fill_(self.delta_len)
-            self.delta_doc_lens.append(n)
+            self.delta_doc_lens.append(n + 1)
         self.maybe_rebuild()
 
     def _make_room(self, needed: int) -> None:
@@ -221,9 +231,11 @@ class GlobalIndex:
         return count
 
     def _finish_swap(self, n_new: int, new_doc_lens: deque[int]) -> None:
-        (self.corpus, self.staging_corpus) = (self.staging_corpus,
-                                              self.corpus)
-        (self.sa, self.staging_sa) = (self.staging_sa, self.sa)
+        # In-place copy instead of a reference swap: captured CUDA
+        # graphs (and compiled propose paths) bind the active tensors'
+        # storage, so the active buffers must keep their identity.
+        self.corpus.copy_(self.staging_corpus)
+        self.sa.copy_(self.staging_sa)
         self.active_len = n_new
         self.active_doc_lens = new_doc_lens
         self._rebuild_event = None
@@ -324,7 +336,8 @@ class GlobalIndex:
         valid = row_active.unsqueeze(2) & (idx < src_len) & (idx >= 0)
         vals = src[idx.clamp(0, n - 1).reshape(b, r * self.k)
                    ].reshape(b, r, self.k)
-        return torch.where(valid & (vals != PAD_TOKEN), vals, -1)
+        ok = valid & (vals != PAD_TOKEN) & (vals >= 0)
+        return torch.where(ok, vals, -1)
 
     def _delta_match(
         self,
