@@ -231,9 +231,11 @@ class GlobalIndex:
         return count
 
     def _finish_swap(self, n_new: int, new_doc_lens: deque[int]) -> None:
-        (self.corpus, self.staging_corpus) = (self.staging_corpus,
-                                              self.corpus)
-        (self.sa, self.staging_sa) = (self.staging_sa, self.sa)
+        # In-place copy instead of a reference swap: captured CUDA
+        # graphs (and compiled propose paths) bind the active tensors'
+        # storage, so the active buffers must keep their identity.
+        self.corpus.copy_(self.staging_corpus)
+        self.sa.copy_(self.staging_sa)
         self.active_len = n_new
         self.active_doc_lens = new_doc_lens
         self._rebuild_event = None
