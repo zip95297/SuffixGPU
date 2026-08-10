@@ -82,41 +82,42 @@ class LocalMatchKernel(nn.Module):
         # (exclusive) equal the length-L tail. Rolling AND over pattern
         # offsets on a left-padded buffer; the cumulative sum of the
         # running AND is exactly the run length.
+        # int32 intermediates: [B, S] buffers dominate transient
+        # memory, and lengths/positions always fit in 32 bits.
         if triton_kernels.available(token_ids, pat):
-            mb = triton_kernels.match_back(token_ids, pat, s).to(
-                torch.int64)
+            mb = triton_kernels.match_back(token_ids, pat, s)
         else:
             lp = F.pad(token_ids, (p, 0), value=-1)
             acc = torch.ones(b, s, dtype=torch.bool, device=device)
-            mb16 = torch.zeros(b, s, dtype=torch.int16, device=device)
-            one = torch.ones((), dtype=torch.int16, device=device)
+            mb = torch.zeros(b, s, dtype=torch.int32, device=device)
+            one = torch.ones((), dtype=torch.int32, device=device)
             for t in range(p):
                 seg = lp[:, p - 1 - t:p - 1 - t + s]
                 acc = acc & (seg == pat[:, t:t + 1])
-                mb16 = mb16 + acc * one
-            mb = mb16.to(torch.int64)
-        pos = torch.arange(s, dtype=torch.int64, device=device)
+                mb = mb + acc * one
+        pos = torch.arange(s, dtype=torch.int32, device=device)
         # End position i = pos + L must satisfy i < q_len: the
         # occurrence starts before the tail and leaves at least one
         # committed continuation token.
-        valid_i = pos.unsqueeze(0) < q_len.unsqueeze(1)
+        valid_i = pos.unsqueeze(0) < q_len.unsqueeze(1).to(torch.int32)
         mb = torch.where(valid_i, mb, torch.zeros_like(mb))
 
-        best_len = mb.max(dim=1).values
+        best_len = mb.max(dim=1).values.to(torch.int64)
         best_len = torch.where(
             (best_len >= self.min_match_len) & combined_mask,
             best_len, torch.zeros_like(best_len))
 
         # All windows matching at the final length (mb >= L contains an
         # occurrence of the length-L tail ending at i).
-        mask = valid_i & (mb >= best_len.unsqueeze(1)) \
+        mask = valid_i & (mb >= best_len.unsqueeze(1).to(torch.int32)) \
             & (best_len > 0).unsqueeze(1)
         occ_count = torch.minimum(
             mask.sum(dim=1),
             torch.full((b,), r, dtype=torch.int64, device=device))
-        key = pos.unsqueeze(0) + (~mask).to(torch.int64) * (s + 1)
+        key = pos.unsqueeze(0) + (~mask).to(torch.int32) * (s + 1)
         width = min(r, s)
-        top = torch.topk(key, width, dim=1, largest=False).values
+        top = torch.topk(key, width, dim=1, largest=False).values.to(
+            torch.int64)
         occ_end = torch.where(top <= s - 1, top, torch.zeros_like(top))
         if width < r:
             occ_end = torch.cat(

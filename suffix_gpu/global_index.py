@@ -372,31 +372,31 @@ class GlobalIndex:
             torch.full((1, 1), -3, dtype=query.dtype, device=device))
 
         if triton_kernels.available(self.delta, pat):
-            mb = triton_kernels.match_back(self.delta, pat, n_i).to(
-                torch.int64)
+            mb = triton_kernels.match_back(self.delta, pat, n_i)
         else:
             lp = torch.cat([
                 torch.full((max_len,), -1, dtype=self.delta.dtype,
                            device=device), self.delta])
             acc = torch.ones(b, n_i, dtype=torch.bool, device=device)
-            mb16 = torch.zeros(b, n_i, dtype=torch.int16, device=device)
-            one = torch.ones((), dtype=torch.int16, device=device)
+            mb = torch.zeros(b, n_i, dtype=torch.int32, device=device)
+            one = torch.ones((), dtype=torch.int32, device=device)
             for t in range(max_len):
                 seg = lp[max_len - 1 - t:max_len - 1 - t + n_i]
                 acc = acc & (seg.unsqueeze(0) == pat[:, t:t + 1])
-                mb16 = mb16 + acc * one
-            mb = mb16.to(torch.int64)
-        pos_i = torch.arange(n_i, dtype=torch.int64, device=device)
+                mb = mb + acc * one
+        pos_i = torch.arange(n_i, dtype=torch.int32, device=device)
         # Window [i - L, i) must lie inside the committed delta region.
-        valid_i = pos_i.unsqueeze(0) <= self.delta_len_t
+        valid_i = pos_i.unsqueeze(0) <= self.delta_len_t.to(torch.int32)
         mb = torch.where(valid_i, mb, torch.zeros_like(mb))
 
-        lo = mb.max(dim=1).values
-        mask = valid_i & (mb >= lo.unsqueeze(1)) & (lo > 0).unsqueeze(1)
+        lo = mb.max(dim=1).values.to(torch.int64)
+        mask = valid_i & (mb >= lo.unsqueeze(1).to(torch.int32)) \
+            & (lo > 0).unsqueeze(1)
         cnt = mask.sum(dim=1)
-        key = pos_i.unsqueeze(0) + (~mask).to(torch.int64) * (n_i + 1)
+        key = pos_i.unsqueeze(0) + (~mask).to(torch.int32) * (n_i + 1)
         width = min(c, n_i)
-        top = torch.topk(key, width, dim=1, largest=False).values
+        top = torch.topk(key, width, dim=1, largest=False).values.to(
+            torch.int64)
         occ_end = torch.where(top <= n_i - 1, top, torch.zeros_like(top))
         occ = (occ_end - lo.unsqueeze(1)).clamp(min=0)
         if width < c:
