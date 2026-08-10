@@ -19,6 +19,8 @@ import math
 
 import torch
 
+from suffix_gpu import triton_kernels
+
 
 def _cmp_pattern(
     sa: torch.Tensor,
@@ -81,6 +83,8 @@ def search_interval(
     Returns:
         (start [B] i64, end [B] i64); empty interval when start == end.
     """
+    if triton_kernels.available(sa, corpus, pattern):
+        return triton_kernels.sa_search(sa, corpus, pattern, pattern_len)
     n = sa.shape[0]
     # Bounds may take n + 1 distinct values; resolve a range of size n + 1.
     iters = max(1, math.ceil(math.log2(n + 1)))

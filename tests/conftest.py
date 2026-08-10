@@ -6,6 +6,8 @@ import torch
 
 def _devices() -> list[str]:
     devs = ["cpu"]
+    if torch.cuda.is_available():
+        devs.append("cuda")
     if torch.backends.mps.is_available():
         devs.append("mps")
     return devs

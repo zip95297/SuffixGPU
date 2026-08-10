@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from suffix_gpu import triton_kernels
 from suffix_gpu.expand import expand_chain
 
 
@@ -81,15 +82,19 @@ class LocalMatchKernel(nn.Module):
         # (exclusive) equal the length-L tail. Rolling AND over pattern
         # offsets on a left-padded buffer; the cumulative sum of the
         # running AND is exactly the run length.
-        lp = F.pad(token_ids, (p, 0), value=-1)
-        acc = torch.ones(b, s, dtype=torch.bool, device=device)
-        mb16 = torch.zeros(b, s, dtype=torch.int16, device=device)
-        one = torch.ones((), dtype=torch.int16, device=device)
-        for t in range(p):
-            seg = lp[:, p - 1 - t:p - 1 - t + s]
-            acc = acc & (seg == pat[:, t:t + 1])
-            mb16 = mb16 + acc * one
-        mb = mb16.to(torch.int64)
+        if triton_kernels.available(token_ids, pat):
+            mb = triton_kernels.match_back(token_ids, pat, s).to(
+                torch.int64)
+        else:
+            lp = F.pad(token_ids, (p, 0), value=-1)
+            acc = torch.ones(b, s, dtype=torch.bool, device=device)
+            mb16 = torch.zeros(b, s, dtype=torch.int16, device=device)
+            one = torch.ones((), dtype=torch.int16, device=device)
+            for t in range(p):
+                seg = lp[:, p - 1 - t:p - 1 - t + s]
+                acc = acc & (seg == pat[:, t:t + 1])
+                mb16 = mb16 + acc * one
+            mb = mb16.to(torch.int64)
         pos = torch.arange(s, dtype=torch.int64, device=device)
         # End position i = pos + L must satisfy i < q_len: the
         # occurrence starts before the tail and leaves at least one

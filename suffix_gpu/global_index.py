@@ -26,6 +26,7 @@ from collections import deque
 
 import torch
 
+from suffix_gpu import triton_kernels
 from suffix_gpu.expand import expand_chain
 from suffix_gpu.sa_search import longest_suffix_match
 from suffix_gpu.suffix_array import build_suffix_array
@@ -370,17 +371,21 @@ class GlobalIndex:
             query.gather(1, pat_idx.clamp(min=0, max=q - 1)),
             torch.full((1, 1), -3, dtype=query.dtype, device=device))
 
-        lp = torch.cat([
-            torch.full((max_len,), -1, dtype=self.delta.dtype,
-                       device=device), self.delta])
-        acc = torch.ones(b, n_i, dtype=torch.bool, device=device)
-        mb16 = torch.zeros(b, n_i, dtype=torch.int16, device=device)
-        one = torch.ones((), dtype=torch.int16, device=device)
-        for t in range(max_len):
-            seg = lp[max_len - 1 - t:max_len - 1 - t + n_i]
-            acc = acc & (seg.unsqueeze(0) == pat[:, t:t + 1])
-            mb16 = mb16 + acc * one
-        mb = mb16.to(torch.int64)
+        if triton_kernels.available(self.delta, pat):
+            mb = triton_kernels.match_back(self.delta, pat, n_i).to(
+                torch.int64)
+        else:
+            lp = torch.cat([
+                torch.full((max_len,), -1, dtype=self.delta.dtype,
+                           device=device), self.delta])
+            acc = torch.ones(b, n_i, dtype=torch.bool, device=device)
+            mb16 = torch.zeros(b, n_i, dtype=torch.int16, device=device)
+            one = torch.ones((), dtype=torch.int16, device=device)
+            for t in range(max_len):
+                seg = lp[max_len - 1 - t:max_len - 1 - t + n_i]
+                acc = acc & (seg.unsqueeze(0) == pat[:, t:t + 1])
+                mb16 = mb16 + acc * one
+            mb = mb16.to(torch.int64)
         pos_i = torch.arange(n_i, dtype=torch.int64, device=device)
         # Window [i - L, i) must lie inside the committed delta region.
         valid_i = pos_i.unsqueeze(0) <= self.delta_len_t
