@@ -1,21 +1,69 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
 [project]
 name = "suffix-gpu"
-version = "0.1.0"
+dynamic = ["version"]
 description = "GPU-resident suffix decoding drafter: suffix-array based speculative drafting with device-side matching, expansion and global memory."
 readme = "README.md"
 requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    { name = "zip95297", email = "zip95297@gmail.com" },
+]
+keywords = [
+    "speculative-decoding",
+    "suffix-array",
+    "llm-inference",
+    "drafter",
+    "cuda",
+    "triton",
+    "vllm",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
 dependencies = ["torch>=2.5"]
 
 [project.optional-dependencies]
-test = ["pytest"]
+test = ["pytest", "numpy"]
 vllm = ["arctic-inference"]
+bench = ["numpy", "arctic-inference", "transformers"]
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+[project.urls]
+Homepage = "https://github.com/zip95297/SuffixGPU"
+Repository = "https://github.com/zip95297/SuffixGPU"
+Issues = "https://github.com/zip95297/SuffixGPU/issues"
+Benchmarks = "https://github.com/zip95297/SuffixGPU/blob/main/RESULTS.md"
+
+[tool.hatch.version]
+path = "suffix_gpu/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["suffix_gpu"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "suffix_gpu",
+    "tests",
+    "benchmarks",
+    "README.md",
+    "RESULTS.md",
+    "LICENSE",
+    "pyproject.toml",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -35,6 +35,15 @@ composes with async scheduling and CUDA-graph capture.
 ## Installation
 
 ```bash
+pip install suffix-gpu                 # library only (torch >= 2.5)
+pip install "suffix-gpu[test]"         # + pytest, numpy
+pip install "suffix-gpu[vllm]"         # + arctic-inference (CPU oracle)
+pip install "suffix-gpu[bench]"        # + benchmark deps (transformers, ...)
+```
+
+From source:
+
+```bash
 uv venv --python 3.12
 source .venv/bin/activate
 uv pip install -e ".[test]"        # + pytest
