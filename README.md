@@ -190,6 +190,13 @@ Every module is tested against the naive references in
 draft/verify equivalence against `arctic-inference` (skipped automatically if
 the package is not installed).
 
+## TODO
+
+- **Global tree save & load interface** — persist the cross-request global
+  memory (corpus ring + suffix array + delta buffer) to disk and restore it
+  across sessions, so the accumulated suffix statistics survive restarts
+  instead of being rebuilt from scratch.
+
 ## References
 
 - Oliaro et al., *SuffixDecoding: A Model-Free Approach to Speeding Up Large
