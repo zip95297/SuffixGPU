@@ -141,17 +141,42 @@ when you manage state updates yourself.
 
 ## Benchmarks
 
+Full results, environment details, and all tables: **[RESULTS.md](RESULTS.md)**.
+
+Drafter-level comparison vs the `arctic_inference.SuffixDecodingCache` CPU
+suffix tree on [Spec-Bench](https://github.com/hemingkx/Spec-Bench) reference
+replay (`question.jsonl`, md5 `0c39ae23e6f213549c66d6d691c99034`, tokenized
+with `NousResearch/Meta-Llama-3.1-8B-Instruct` rev `d10aef79`) — NVIDIA L20,
+torch 2.13, batch = whole category (58–80 requests), k=16:
+
+| | tokens/step (cold / warm global) | propose per step, B=80 warm |
+| --- | --- | --- |
+| arctic suffix-cpu | 1.10–1.57 / 6.3–11.1 | 1.0–3.4 ms (loop over batch) |
+| **SuffixGPU (CUDA graph)** | 1.09–1.56 / 6.2–11.2 | **0.5 ms**, flat, no host sync |
+
+- **Correctness**: 221 tests pass, including fuzz equivalence vs arctic on
+  unambiguous corpora; teacher-forced lockstep on Spec-Bench gives 54–77%
+  token-identical drafts (residual = majority-vote tie ordering) with
+  comparable useful-draft length against the reference continuation.
+- **Batch scaling (warm)**: CPU wins small batches (B≤32); crossover at
+  B≈64–128; at B=128/256/512 the GPU graph path is **2.2× / 2.7× / 2.1×
+  faster** than the CPU speculate loop — and it never syncs to the host,
+  so it composes with async scheduling and CUDA graphs.
+- **Memory**: ≤ 532 MB reserved VRAM at B=256, S=16384, 4M-token corpus
+  (persistent drafter state 96 MB; no extra CUDA-graph pool retention).
+
 ```bash
-# accuracy vs the Arctic CPU implementation + latency sweep (eager & CUDA graph)
+# Spec-Bench replay + lockstep agreement vs the Arctic CPU implementation
+python benchmarks/bench_specbench.py --mode both --device cuda \
+    --data question.jsonl --tokenizer NousResearch/Meta-Llama-3.1-8B-Instruct
+
+# synthetic accuracy + latency sweep (eager & CUDA graph)
 python benchmarks/bench_vs_cpu.py --mode both --device cuda \
     --batch 32 --k 16 --spec-factor 2.0 --min-token-prob 0.1
 
 # persistent buffer / peak / CUDA-graph pool memory accounting
 python benchmarks/bench_memory.py --device cuda
 ```
-
-`bench_vs_cpu.py` simulates speculative decoding and reports tokens/step and
-acceptance rate against `arctic_inference.SuffixDecodingCache` as the oracle.
 
 ## Testing
 
