@@ -7,11 +7,16 @@
 # The GitHub-side "pypi" environment is created automatically on first
 # run; optionally add required reviewers to it for release approval.
 #
+# Branching model: `publish` is the release (and GitHub default)
+# branch and carries the packaging metadata (pyproject, LICENSE, this
+# workflow); `main` is the development branch.
+#
 # To release:
-#   1. bump __version__ in suffix_gpu/__init__.py (single version source)
-#   2. merge to main (this file must exist on the default branch)
-#   3. git tag vX.Y.Z && git push origin vX.Y.Z   (tag must match the
-#      version — PyPI rejects re-uploads of an existing version)
+#   1. git checkout publish && git merge main      # pull in dev work
+#   2. bump __version__ in suffix_gpu/__init__.py (single version source)
+#   3. git tag vX.Y.Z && git push origin publish vX.Y.Z
+# The tagged commit must contain this file (always true when tagging on
+# publish); the tag must be a new version — PyPI rejects re-uploads.
 name: Publish to PyPI
 
 on:
