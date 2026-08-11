@@ -217,10 +217,6 @@ capture retains no extra pool memory beyond the eager working set.
 ## Reproduce
 
 ```bash
-# machine-specific quirk on this box only: userland libcuda (535) is
-# older than the kernel driver (580) — preload the matching one:
-export LD_PRELOAD=/usr/local/nvidia/lib64/libcuda.so.580.105.08
-
 uv pip install -e ".[test,vllm]"     # pytest + arctic-inference oracle
 
 # data: Spec-Bench question.jsonl (md5 0c39ae23e6f213549c66d6d691c99034)
