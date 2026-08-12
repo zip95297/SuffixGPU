@@ -87,7 +87,7 @@ when you manage state updates yourself.
 | `device` | `"cpu"` | Torch device for all buffers |
 | `max_pattern_len` | `32` | Longest suffix (pattern) considered for matching |
 | `min_match_len` | `1` | Minimum suffix match length to draft from |
-| `max_occurrences` | `32` | Occurrences kept per match for expansion/voting |
+| `max_occurrences` | `128` | Occurrences kept per match for expansion/voting |
 | `enable_global` | `False` | Enable the cross-request suffix-array memory |
 | `global_capacity` | `1<<22` | Corpus ring capacity (tokens) |
 | `delta_capacity` | `1<<16` | Append-only delta buffer capacity |
@@ -95,7 +95,7 @@ when you manage state updates yourself.
 | `rebuild_stream` | `None` | CUDA stream for background rebuilds |
 | `max_spec_factor` / `max_spec_offset` | `None` / `0.0` | Adaptive draft-length cap: `factor * match_len + offset` |
 | `min_token_prob` | `0.0` | Cumulative-probability cutoff during expansion |
-| `num_backoff` | `4` | Candidate match lengths per path: local support thresholds `2^0..2^(C-1)`, global capped lengths halving from `max_pattern_len` (plus a final 2; distinct caps saturate at ~log2 of the pattern length). `1` = longest match only; larger values probe more lengths at small marginal cost |
+| `num_backoff` | `8` | Candidate match lengths per path: local support thresholds `2^0..2^(C-1)`, global capped lengths halving from `max_pattern_len` (plus a final 2; distinct caps saturate at ~log2 of the pattern length). `1` = longest match only; larger values probe more lengths at small marginal cost |
 
 ## How it works
 
@@ -173,6 +173,8 @@ torch 2.13, batch = whole category (58–80 requests), k=16:
 - **Memory**: ≤ 532 MB reserved VRAM at B=256, S=16384, 4M-token corpus
   (persistent drafter state 96 MB; no extra CUDA-graph pool retention).
 
+- **Drafter-level knob sweep:** full B/occ/backoff CPU/eager/graph timing tables are moved to the end of this README to keep the main benchmark section compact.
+
 ```bash
 # Spec-Bench replay + lockstep agreement vs the Arctic CPU implementation
 python benchmarks/bench_specbench.py --mode both --device cuda \
@@ -221,3 +223,147 @@ the package is not installed).
 - Manber & Myers, *Suffix Arrays: A New Method for On-Line String Searches*
   (SIAM J. Comput., 1993) — the prefix-doubling construction in
   `suffix_gpu/suffix_array.py`.
+
+## Drafter-level knob sweep details
+
+- **Drafter-level knob sweep (L20, k=16, depth=24, synthetic `bench_vs_cpu` workload, 10 iters):**
+
+  CPU time depends on batch size and workload, but not on GPU-only `max_occurrences` / `num_backoff` knobs.
+
+  High-repetition workload.
+
+  | B | max_occurrences | num_backoff | CPU ms | GPU eager ms | GPU graph ms |
+  | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 32 | 32 | 1 | 0.481 | 2.585 | 0.414 |
+  | 32 | 32 | 4 | 0.481 | 2.655 | 0.433 |
+  | 32 | 32 | 8 | 0.481 | 2.830 | 0.441 |
+  | 32 | 32 | 16 | 0.481 | 2.579 | 0.463 |
+  | 32 | 64 | 1 | 0.481 | 2.662 | 0.449 |
+  | 32 | 64 | 4 | 0.481 | 3.032 | 0.474 |
+  | 32 | 64 | 8 | 0.481 | 2.421 | 0.489 |
+  | 32 | 64 | 16 | 0.481 | 2.713 | 0.532 |
+  | 32 | 128 | 1 | 0.481 | 2.798 | 0.510 |
+  | 32 | 128 | 4 | 0.481 | 2.765 | 0.559 |
+  | 32 | 128 | 8 | 0.481 | 2.637 | 0.593 |
+  | 32 | 128 | 16 | 0.481 | 2.561 | 0.698 |
+  | 32 | 256 | 1 | 0.481 | 2.583 | 0.692 |
+  | 32 | 256 | 4 | 0.481 | 2.612 | 0.789 |
+  | 32 | 256 | 8 | 0.481 | 2.493 | 0.959 |
+  | 32 | 256 | 16 | 0.481 | 2.539 | 1.150 |
+  | 64 | 32 | 1 | 0.762 | 2.537 | 0.404 |
+  | 64 | 32 | 4 | 0.762 | 2.890 | 0.428 |
+  | 64 | 32 | 8 | 0.762 | 2.576 | 0.441 |
+  | 64 | 32 | 16 | 0.762 | 2.447 | 0.468 |
+  | 64 | 64 | 1 | 0.762 | 2.484 | 0.435 |
+  | 64 | 64 | 4 | 0.762 | 2.928 | 0.486 |
+  | 64 | 64 | 8 | 0.762 | 2.623 | 0.528 |
+  | 64 | 64 | 16 | 0.762 | 3.418 | 0.598 |
+  | 64 | 128 | 1 | 0.762 | 2.570 | 0.504 |
+  | 64 | 128 | 4 | 0.762 | 2.558 | 0.609 |
+  | 64 | 128 | 8 | 0.762 | 2.634 | 0.749 |
+  | 64 | 128 | 16 | 0.762 | 2.674 | 0.935 |
+  | 64 | 256 | 1 | 0.762 | 2.503 | 0.693 |
+  | 64 | 256 | 4 | 0.762 | 2.653 | 1.108 |
+  | 64 | 256 | 8 | 0.762 | 2.717 | 1.307 |
+  | 64 | 256 | 16 | 0.762 | 2.794 | 2.005 |
+  | 128 | 32 | 1 | 2.226 | 2.611 | 0.599 |
+  | 128 | 32 | 4 | 2.226 | 2.687 | 0.706 |
+  | 128 | 32 | 8 | 2.226 | 2.524 | 0.737 |
+  | 128 | 32 | 16 | 2.226 | 2.476 | 0.788 |
+  | 128 | 64 | 1 | 2.226 | 2.427 | 0.646 |
+  | 128 | 64 | 4 | 2.226 | 2.615 | 0.817 |
+  | 128 | 64 | 8 | 2.226 | 2.707 | 0.902 |
+  | 128 | 64 | 16 | 2.226 | 2.743 | 1.026 |
+  | 128 | 128 | 1 | 2.226 | 2.535 | 0.750 |
+  | 128 | 128 | 4 | 2.226 | 2.570 | 1.098 |
+  | 128 | 128 | 8 | 2.226 | 2.557 | 1.325 |
+  | 128 | 128 | 16 | 2.226 | 2.512 | 1.713 |
+  | 128 | 256 | 1 | 2.226 | 2.380 | 1.074 |
+  | 128 | 256 | 4 | 2.226 | 2.728 | 1.907 |
+  | 128 | 256 | 8 | 2.226 | 2.967 | 2.733 |
+  | 128 | 256 | 16 | 2.226 | 4.183 | 3.951 |
+  | 256 | 32 | 1 | 4.067 | 5.592 | 0.887 |
+  | 256 | 32 | 4 | 4.067 | 3.054 | 1.057 |
+  | 256 | 32 | 8 | 4.067 | 2.626 | 1.115 |
+  | 256 | 32 | 16 | 4.067 | 2.885 | 1.196 |
+  | 256 | 64 | 1 | 4.067 | 2.614 | 0.946 |
+  | 256 | 64 | 4 | 4.067 | 2.935 | 1.264 |
+  | 256 | 64 | 8 | 4.067 | 2.971 | 1.415 |
+  | 256 | 64 | 16 | 4.067 | 3.249 | 1.674 |
+  | 256 | 128 | 1 | 4.067 | 2.724 | 1.076 |
+  | 256 | 128 | 4 | 4.067 | 2.742 | 1.801 |
+  | 256 | 128 | 8 | 4.067 | 2.755 | 2.256 |
+  | 256 | 128 | 16 | 4.067 | 3.552 | 3.136 |
+  | 256 | 256 | 1 | 4.067 | 2.565 | 1.697 |
+  | 256 | 256 | 4 | 4.067 | 3.770 | 3.561 |
+  | 256 | 256 | 8 | 4.067 | 5.315 | 5.095 |
+  | 256 | 256 | 16 | 4.067 | 7.846 | 7.626 |
+
+  Low-repetition workload.
+
+  | B | max_occurrences | num_backoff | CPU ms | GPU eager ms | GPU graph ms |
+  | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 32 | 32 | 1 | 0.214 | 2.512 | 0.413 |
+  | 32 | 32 | 4 | 0.214 | 2.485 | 0.434 |
+  | 32 | 32 | 8 | 0.214 | 2.592 | 0.439 |
+  | 32 | 32 | 16 | 0.214 | 2.516 | 0.462 |
+  | 32 | 64 | 1 | 0.214 | 2.578 | 0.447 |
+  | 32 | 64 | 4 | 0.214 | 2.520 | 0.473 |
+  | 32 | 64 | 8 | 0.214 | 2.845 | 0.487 |
+  | 32 | 64 | 16 | 0.214 | 2.607 | 0.532 |
+  | 32 | 128 | 1 | 0.214 | 2.597 | 0.509 |
+  | 32 | 128 | 4 | 0.214 | 2.637 | 0.558 |
+  | 32 | 128 | 8 | 0.214 | 3.020 | 0.590 |
+  | 32 | 128 | 16 | 0.214 | 2.778 | 0.696 |
+  | 32 | 256 | 1 | 0.214 | 2.776 | 0.691 |
+  | 32 | 256 | 4 | 0.214 | 2.715 | 0.787 |
+  | 32 | 256 | 8 | 0.214 | 2.604 | 0.954 |
+  | 32 | 256 | 16 | 0.214 | 2.725 | 1.149 |
+  | 64 | 32 | 1 | 0.829 | 2.389 | 0.404 |
+  | 64 | 32 | 4 | 0.829 | 2.681 | 0.428 |
+  | 64 | 32 | 8 | 0.829 | 2.534 | 0.442 |
+  | 64 | 32 | 16 | 0.829 | 2.567 | 0.468 |
+  | 64 | 64 | 1 | 0.829 | 2.411 | 0.435 |
+  | 64 | 64 | 4 | 0.829 | 2.622 | 0.484 |
+  | 64 | 64 | 8 | 0.829 | 2.553 | 0.529 |
+  | 64 | 64 | 16 | 0.829 | 2.603 | 0.599 |
+  | 64 | 128 | 1 | 0.829 | 2.577 | 0.504 |
+  | 64 | 128 | 4 | 0.829 | 2.541 | 0.610 |
+  | 64 | 128 | 8 | 0.829 | 2.753 | 0.752 |
+  | 64 | 128 | 16 | 0.829 | 2.743 | 0.936 |
+  | 64 | 256 | 1 | 0.829 | 2.404 | 0.694 |
+  | 64 | 256 | 4 | 0.829 | 2.498 | 1.106 |
+  | 64 | 256 | 8 | 0.829 | 2.562 | 1.306 |
+  | 64 | 256 | 16 | 0.829 | 2.749 | 1.991 |
+  | 128 | 32 | 1 | 1.325 | 2.542 | 0.608 |
+  | 128 | 32 | 4 | 1.325 | 2.559 | 0.671 |
+  | 128 | 32 | 8 | 1.325 | 2.610 | 0.688 |
+  | 128 | 32 | 16 | 1.325 | 2.619 | 0.736 |
+  | 128 | 64 | 1 | 1.325 | 2.688 | 0.656 |
+  | 128 | 64 | 4 | 1.325 | 2.469 | 0.775 |
+  | 128 | 64 | 8 | 1.325 | 2.660 | 0.851 |
+  | 128 | 64 | 16 | 1.325 | 2.868 | 0.975 |
+  | 128 | 128 | 1 | 1.325 | 2.650 | 0.760 |
+  | 128 | 128 | 4 | 1.325 | 2.581 | 1.051 |
+  | 128 | 128 | 8 | 1.325 | 2.615 | 1.278 |
+  | 128 | 128 | 16 | 1.325 | 2.771 | 1.648 |
+  | 128 | 256 | 1 | 1.325 | 2.894 | 1.073 |
+  | 128 | 256 | 4 | 1.325 | 2.778 | 1.870 |
+  | 128 | 256 | 8 | 1.325 | 2.954 | 2.671 |
+  | 128 | 256 | 16 | 1.325 | 4.100 | 3.897 |
+  | 256 | 32 | 1 | 3.216 | 2.956 | 0.886 |
+  | 256 | 32 | 4 | 3.216 | 2.622 | 1.012 |
+  | 256 | 32 | 8 | 3.216 | 2.570 | 1.094 |
+  | 256 | 32 | 16 | 3.216 | 2.592 | 1.176 |
+  | 256 | 64 | 1 | 3.216 | 2.666 | 0.946 |
+  | 256 | 64 | 4 | 3.216 | 2.674 | 1.210 |
+  | 256 | 64 | 8 | 3.216 | 2.781 | 1.399 |
+  | 256 | 64 | 16 | 3.216 | 3.032 | 1.658 |
+  | 256 | 128 | 1 | 3.216 | 2.679 | 1.075 |
+  | 256 | 128 | 4 | 3.216 | 3.709 | 1.751 |
+  | 256 | 128 | 8 | 3.216 | 2.625 | 2.235 |
+  | 256 | 128 | 16 | 3.216 | 3.327 | 3.119 |
+  | 256 | 256 | 1 | 3.216 | 2.648 | 1.690 |
+  | 256 | 256 | 4 | 3.216 | 3.724 | 3.505 |
+  | 256 | 256 | 8 | 3.216 | 5.310 | 5.072 |
+  | 256 | 256 | 16 | 3.216 | 7.832 | 7.606 |

@@ -35,7 +35,7 @@ class SuffixGPUDrafter:
         device: torch.device | str = "cpu",
         max_pattern_len: int = 32,
         min_match_len: int = 1,
-        max_occurrences: int = 32,
+        max_occurrences: int = 128,
         enable_global: bool = False,
         global_capacity: int = 1 << 22,
         delta_capacity: int = 1 << 16,
@@ -44,7 +44,7 @@ class SuffixGPUDrafter:
         max_spec_factor: float | None = None,
         max_spec_offset: float = 0.0,
         min_token_prob: float = 0.0,
-        num_backoff: int = 4,
+        num_backoff: int = 8,
     ):
         self.k = k
         self.device = torch.device(device)
