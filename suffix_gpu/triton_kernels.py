@@ -6,7 +6,10 @@ Each kernel replaces a long chain of small torch ops with one launch:
   (local matcher rows and the shared delta buffer).
 - sa_search: the full merged lower/upper-bound binary search over the
   suffix array, one thread-row per (bound, pattern) pair.
-- expand_chain: the depth-wise majority-vote chain expansion.
+- expand_chain: the depth-wise majority-vote chain expansion with
+  fused arctic-style scoring.
+- first_occurrences: earliest match positions per backoff candidate,
+  an early-exit scan that replaces a batched topk.
 
 All entry points have pure-torch fallbacks in their call sites; these
 paths require CUDA tensors and are exercised by the same oracle tests
@@ -91,15 +94,18 @@ if HAS_TRITON:
         tl.store(out_ptr + row, lo, mask=m_row)
 
     @triton.jit
-    def _expand_chain_kernel(cont_ptr, nocc_ptr, chain_ptr, nv_ptr,
-                             min_prob, R: tl.constexpr, K: tl.constexpr,
+    def _expand_chain_kernel(cont_ptr, nocc_ptr, cap_ptr, chain_ptr,
+                             nv_ptr, nemit_ptr, score_ptr, min_prob,
+                             R: tl.constexpr, K: tl.constexpr,
                              RP: tl.constexpr):
         b = tl.program_id(0)
         r = tl.arange(0, RP)
         occ = tl.load(nocc_ptr + b)
+        cap = tl.load(cap_ptr + b)
         ok = (r < R) & (r < occ)
         nv = tl.zeros((), dtype=tl.int32)
         prob = tl.zeros((), dtype=tl.float32) + 1.0
+        score = tl.zeros((), dtype=tl.float32)
         for d in tl.static_range(K):
             c = tl.load(cont_ptr + b * R * K + r * K + d,
                         mask=r < R, other=-1)
@@ -114,9 +120,41 @@ if HAS_TRITON:
             prob = prob * (mx.to(tl.float32) / nact.to(tl.float32))
             valid = (mx > 0) & (prob >= min_prob)
             tl.store(chain_ptr + b * K + d, tl.where(valid, tok, -1))
+            score += tl.where(valid & (d < cap), prob, 0.0)
             nv += valid.to(tl.int32)
             ok = ok & (c == tok) & valid
         tl.store(nv_ptr + b, nv)
+        cap0 = tl.maximum(cap, 0)
+        tl.store(nemit_ptr + b, tl.minimum(nv.to(tl.int64), cap0))
+        tl.store(score_ptr + b, score)
+
+    @triton.jit
+    def _first_occ_kernel(mb_ptr, thr_ptr, out_ptr, cnt_ptr, n_cols,
+                          C: tl.constexpr, R: tl.constexpr,
+                          RP: tl.constexpr, BLOCK: tl.constexpr):
+        row = tl.program_id(0)
+        b = row // C
+        thr = tl.load(thr_ptr + row).to(tl.int32)
+        found = tl.zeros((), dtype=tl.int32)
+        # mb is pre-zeroed at invalid positions, so thr >= 1 alone
+        # defines a hit; thr == 0 rows skip the scan.
+        off = tl.where(thr > 0, 0, n_cols).to(tl.int32)
+        while (off < n_cols) & (found < R):
+            idx = off + tl.arange(0, BLOCK)
+            v = tl.load(mb_ptr + b * n_cols + idx, mask=idx < n_cols,
+                        other=0)
+            hit = v >= thr
+            hcum = tl.cumsum(hit.to(tl.int32), axis=0)
+            slot = found + hcum - 1
+            tl.store(out_ptr + row * R + slot, idx,
+                     mask=hit & (slot < R))
+            found = tl.minimum(found + tl.sum(hit.to(tl.int32), axis=0),
+                               R)
+            off += BLOCK
+        rr = tl.arange(0, RP)
+        tl.store(out_ptr + row * R + rr, 0,
+                 mask=(rr >= found) & (rr < R))
+        tl.store(cnt_ptr + row, found)
 
     @triton.jit
     def _scatter_append_kernel(tok_ptr, base_ptr, cnt_ptr, samp_ptr,
@@ -179,18 +217,52 @@ def sa_search(sa: torch.Tensor, corpus: torch.Tensor,
 
 
 def expand_chain(cont: torch.Tensor, num_occ: torch.Tensor, k: int,
-                 min_token_prob: float) -> tuple[torch.Tensor,
-                                                 torch.Tensor]:
-    """Depth-wise majority-vote chain expansion (one launch)."""
+                 min_token_prob: float,
+                 cap: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor,
+                                             torch.Tensor, torch.Tensor]:
+    """Majority-vote chain expansion with fused scoring (one launch)."""
     b, r, _ = cont.shape
     cont = cont.to(torch.int32).contiguous()
     nocc = num_occ.to(torch.int64).contiguous()
+    capc = cap.to(torch.int64).contiguous()
     chain = torch.empty(b, k, dtype=torch.int32, device=cont.device)
     nv = torch.empty(b, dtype=torch.int32, device=cont.device)
+    nemit = torch.empty(b, dtype=torch.int64, device=cont.device)
+    score = torch.empty(b, dtype=torch.float32, device=cont.device)
     rp = max(triton.next_power_of_2(r), 2)
-    _expand_chain_kernel[(b,)](cont, nocc, chain, nv,
+    _expand_chain_kernel[(b,)](cont, nocc, capc, chain, nv, nemit, score,
                                float(min_token_prob), R=r, K=k, RP=rp)
-    return chain, nv.to(torch.int64)
+    return chain, nv.to(torch.int64), nemit, score
+
+
+def first_occurrences(mb: torch.Tensor, thr: torch.Tensor, c: int,
+                      r: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Earliest positions with match_back >= per-candidate threshold.
+
+    Sequential scan per (row, candidate) with early exit after r hits,
+    so the cost is nearly flat in the candidate count.
+
+    Args:
+        mb: [B, N] int32 match_back values, zeroed at invalid
+            positions.
+        thr: [B * C] per-candidate thresholds (0 disables the row).
+        c: candidates per row (C).
+        r: max occurrences.
+
+    Returns:
+        (positions [B*C, r] i64, zero-padded past the count;
+         count [B*C] i64 clamped to r).
+    """
+    bc = thr.shape[0]
+    n = mb.shape[1]
+    mb = mb.contiguous()
+    thr = thr.to(torch.int32).contiguous()
+    out = torch.empty(bc, r, dtype=torch.int32, device=mb.device)
+    cnt = torch.empty(bc, dtype=torch.int32, device=mb.device)
+    rp = max(triton.next_power_of_2(r), 2)
+    _first_occ_kernel[(bc,)](mb, thr, out, cnt, n, C=c, R=r, RP=rp,
+                             BLOCK=1024)
+    return out.to(torch.int64), cnt.to(torch.int64)
 
 
 def scatter_append(token_ids_gpu: torch.Tensor, base: torch.Tensor,

@@ -28,7 +28,7 @@ import torch
 
 from suffix_gpu import triton_kernels
 from suffix_gpu.expand import expand_chain
-from suffix_gpu.sa_search import longest_suffix_match
+from suffix_gpu.sa_search import suffix_match_backoff
 from suffix_gpu.suffix_array import build_suffix_array
 
 PAD_TOKEN = torch.iinfo(torch.int32).max
@@ -275,17 +275,50 @@ class GlobalIndex:
              occ_count [B] i64). Occurrences come from either the SA or
             the delta, whichever matched longer (ties prefer the SA).
         """
+        caps = torch.full((1,), max_len, dtype=torch.int64,
+                          device=self.device)
+        match_len, cont, occ_count = self._query_backoff(
+            query, query_len, max_len, caps)
+        return match_len[:, 0], cont[:, 0], occ_count[:, 0]
+
+    def _query_backoff(
+        self,
+        query: torch.Tensor,
+        query_len: torch.Tensor,
+        max_len: int,
+        caps: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Capped-length matches against corpus + delta, one pass each.
+
+        The SA is walked once for all lengths 1..max_len and each cap
+        selects its longest hit; the delta match_back runs once at
+        max_len, since a capped match is min(match_back, cap).
+
+        Args:
+            query: [B, P] int32 padded query tails.
+            query_len: [B] int64 valid lengths.
+            max_len: maximum match length.
+            caps: [C] i64 per-candidate match-length caps.
+
+        Returns:
+            (match_len [B, C] i64, cont [B, C, R, k] int32 padded with
+             -1, occ_count [B, C] i64). Per cap, occurrences come from
+            either the SA or the delta, whichever matched longer (ties
+            prefer the SA).
+        """
         b = query.shape[0]
+        cnum = caps.shape[0]
         r = self.max_occurrences
         device = self.device
 
-        sa_len, sa_start, sa_end = longest_suffix_match(
-            self.sa, self.corpus, query, query_len, max_len)
-        d_len, d_pos, d_cnt = self._delta_match(query, query_len, max_len)
+        sa_len, sa_start, sa_end = suffix_match_backoff(
+            self.sa, self.corpus, query, query_len, max_len, caps)
+        d_len, d_pos, d_cnt = self._delta_match_backoff(
+            query, query_len, max_len, caps)
 
         use_sa = (sa_len >= d_len) & (sa_len > 0)
         use_delta = (d_len > sa_len) & (d_len > 0)
-        zero = torch.zeros(b, dtype=torch.int64, device=device)
+        zero = torch.zeros(b, cnum, dtype=torch.int64, device=device)
         match_len = torch.where(use_sa, sa_len,
                                 torch.where(use_delta, d_len, zero))
 
@@ -294,28 +327,103 @@ class GlobalIndex:
         # a prefix would bias the vote toward small token ids).
         offs = torch.arange(r, dtype=torch.int64, device=device)
         ilen = sa_end - sa_start
-        strided = sa_start.unsqueeze(1) + (offs.unsqueeze(0)
-                                           * ilen.unsqueeze(1)) // r
-        seq = sa_start.unsqueeze(1) + offs.unsqueeze(0)
-        sa_idx = torch.where((ilen > r).unsqueeze(1), strided, seq).clamp(
+        strided = sa_start.unsqueeze(2) + (offs.view(1, 1, r)
+                                           * ilen.unsqueeze(2)) // r
+        seq = sa_start.unsqueeze(2) + offs.view(1, 1, r)
+        sa_idx = torch.where((ilen > r).unsqueeze(2), strided, seq).clamp(
             0, self.capacity - 1)
         sa_cnt = torch.minimum(ilen, torch.full_like(ilen, r))
-        take = offs.unsqueeze(0) < sa_cnt.unsqueeze(1)
-        pos = self.sa[sa_idx.reshape(-1)].reshape(b, r)
+        take = offs.view(1, 1, r) < sa_cnt.unsqueeze(2)
+        pos = self.sa[sa_idx.reshape(-1)].reshape(b, cnum, r)
         sa_occ = torch.where(take, pos, 0)
-        sa_cont = self._gather_cont(self.corpus, self.capacity, sa_occ,
-                                    sa_cnt, match_len, use_sa)
-        d_cont = self._gather_cont(self.delta, self.delta_len_t, d_pos,
-                                   d_cnt, match_len, use_delta)
 
-        cont = torch.full((b, r, self.k), -1, dtype=torch.int32,
+        flat_len = match_len.reshape(b * cnum)
+        sa_cont = self._gather_cont(
+            self.corpus, self.capacity, sa_occ.reshape(b * cnum, r),
+            sa_cnt.reshape(b * cnum), flat_len, use_sa.reshape(b * cnum))
+        d_cont = self._gather_cont(
+            self.delta, self.delta_len_t, d_pos.reshape(b * cnum, r),
+            d_cnt.reshape(b * cnum), flat_len, use_delta.reshape(b * cnum))
+
+        cont = torch.full((b * cnum, r, self.k), -1, dtype=torch.int32,
                           device=device)
-        cont = torch.where(use_sa.unsqueeze(1).unsqueeze(2), sa_cont, cont)
-        cont = torch.where(use_delta.unsqueeze(1).unsqueeze(2), d_cont,
-                           cont)
+        sel_sa = use_sa.reshape(b * cnum, 1, 1)
+        sel_delta = use_delta.reshape(b * cnum, 1, 1)
+        cont = torch.where(sel_sa, sa_cont, cont)
+        cont = torch.where(sel_delta, d_cont, cont)
         occ_count = torch.where(use_sa, sa_cnt,
                                 torch.where(use_delta, d_cnt, zero))
-        return match_len, cont, occ_count
+        return match_len, cont.reshape(b, cnum, r, self.k), occ_count
+
+    def draft(
+        self,
+        query: torch.Tensor,
+        query_len: torch.Tensor,
+        max_len: int,
+        k: int,
+        min_token_prob: float = 0.0,
+        max_spec_factor: float | None = None,
+        max_spec_offset: float = 0.0,
+        caps: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor]:
+        """Multi-length scored draft over corpus + delta.
+
+        Matches at several capped lengths (a shorter cap widens the SA
+        interval / delta occurrence set) in one SA and one delta pass,
+        expands and scores all candidate chains in one fused call
+        (score = sum of per-depth chain probabilities, emission capped
+        by floor(max_spec_factor * match_len + max_spec_offset)) and
+        keeps the best-scored candidate. `caps` must be sorted
+        descending: on exact score ties the first (longest) cap wins,
+        mirroring arctic.
+
+        Args:
+            caps: optional [C] i64 descending length caps; defaults to
+                {max_len, max_len/2, max_len/4, 2}.
+
+        Returns:
+            (chain [B, k] int32, num_valid [B] i64, match_len [B] i64,
+             occ_count [B] i64, score [B] f32)
+        """
+        b = query.shape[0]
+        device = self.device
+        if caps is None:
+            caps = torch.tensor(
+                sorted({max_len, max(2, max_len // 2),
+                        max(2, max_len // 4), 2}, reverse=True),
+                dtype=torch.int64, device=device)
+        cnum = caps.shape[0]
+
+        match_len, cont, occ_count = self._query_backoff(
+            query, query_len, max_len, caps)
+        flat_len = match_len.reshape(b * cnum)
+        if max_spec_factor is None:
+            cap_emit = torch.full_like(flat_len, k)
+        else:
+            cap_emit = (max_spec_factor * flat_len.to(torch.float32)
+                        + max_spec_offset).floor().to(torch.int64).clamp(
+                            min=0)
+        chain, _, num_emit, score = expand_chain(
+            cont.reshape(b * cnum, self.max_occurrences, k),
+            occ_count.reshape(b * cnum), k,
+            min_token_prob=min_token_prob, cap=cap_emit)
+
+        score = score.reshape(b, cnum)
+        # First max = longest cap (caps are descending), matching the
+        # sequential strict-> loop of the per-cap implementation.
+        best = score.argmax(dim=1)
+        bidx = torch.arange(b, device=device)
+        best_chain = chain.reshape(b, cnum, k)[bidx, best]
+        best_emit = num_emit.reshape(b, cnum)[bidx, best]
+        best_len = match_len[bidx, best]
+        best_occ = occ_count[bidx, best]
+        best_score = score[bidx, best]
+
+        slot = torch.arange(k, device=device).unsqueeze(0)
+        best_chain = torch.where(slot < best_emit.unsqueeze(1), best_chain,
+                                 -1)
+        return best_chain, best_emit, best_len, best_occ, best_score
 
     def _gather_cont(
         self,
@@ -339,23 +447,29 @@ class GlobalIndex:
         ok = valid & (vals != PAD_TOKEN) & (vals >= 0)
         return torch.where(ok, vals, -1)
 
-    def _delta_match(
+    def _delta_match_backoff(
         self,
         query: torch.Tensor,
         query_len: torch.Tensor,
         max_len: int,
+        caps: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Longest match within the delta buffer, fully verified.
+        """Capped longest matches within the delta buffer, one pass.
 
         One pass computes match_back[i]: the longest common suffix of
         the delta tokens ending at i (exclusive) and each query tail.
-        A window of length L starting at pos matches iff
-        match_back[pos + L] >= L, so the longest match is a single max.
-        Returns (match_len [B], positions [B, C] compacted left in
-        position order, count [B] clamped to C).
+        Truncating the pattern to a cap gives min(match_back, cap), so
+        every cap is served by the same match_back: the capped longest
+        match is min(max_i match_back[i], cap) and its occurrence set
+        is a threshold of match_back. Earliest occurrences for all
+        caps come from one batched smallest-k topk over position keys.
+
+        Returns (match_len [B, C], start positions [B, C, R] compacted
+        left in position order, count [B, C] clamped to R).
         """
         b = query.shape[0]
-        c = self.max_occurrences
+        cnum = caps.shape[0]
+        r = self.max_occurrences
         device = self.device
         cap = self.delta_capacity
         q = query.shape[1]
@@ -389,24 +503,36 @@ class GlobalIndex:
         valid_i = pos_i.unsqueeze(0) <= self.delta_len_t.to(torch.int32)
         mb = torch.where(valid_i, mb, torch.zeros_like(mb))
 
-        lo = mb.max(dim=1).values.to(torch.int64)
-        mask = valid_i & (mb >= lo.unsqueeze(1).to(torch.int32)) \
-            & (lo > 0).unsqueeze(1)
-        cnt = mask.sum(dim=1)
-        key = pos_i.unsqueeze(0) + (~mask).to(torch.int32) * (n_i + 1)
-        width = min(c, n_i)
-        top = torch.topk(key, width, dim=1, largest=False).values.to(
-            torch.int64)
-        occ_end = torch.where(top <= n_i - 1, top, torch.zeros_like(top))
-        occ = (occ_end - lo.unsqueeze(1)).clamp(min=0)
-        if width < c:
-            occ = torch.cat([
-                occ, torch.zeros(b, c - width, dtype=torch.int64,
-                                 device=device)], dim=1)
-        return lo, occ, torch.minimum(cnt, torch.full_like(cnt, c))
+        lo_full = mb.max(dim=1).values.to(torch.int64)  # [B]
+        lo = torch.minimum(lo_full.unsqueeze(1), caps.view(1, cnum))
+        if triton_kernels.available(mb, lo):
+            occ_end, cnt = triton_kernels.first_occurrences(
+                mb, lo.reshape(b * cnum), cnum, r)
+            occ_end = occ_end.reshape(b, cnum, r)
+            cnt = cnt.reshape(b, cnum)
+        else:
+            mask = (valid_i.unsqueeze(1)
+                    & (mb.unsqueeze(1) >= lo.unsqueeze(2).to(torch.int32))
+                    & (lo > 0).unsqueeze(2))  # [B, C, N]
+            cnt = mask.sum(dim=2).clamp(max=r)
+            key = pos_i.view(1, 1, n_i) + (~mask).to(torch.int32) * (n_i + 1)
+            width = min(r, n_i)
+            top = torch.topk(key.reshape(b * cnum, n_i), width, dim=1,
+                             largest=False).values.to(torch.int64)
+            occ_end = torch.where(top <= n_i - 1, top,
+                                  torch.zeros_like(top))
+            if width < r:
+                occ_end = torch.cat(
+                    [occ_end, torch.zeros(b * cnum, r - width,
+                                          dtype=torch.int64,
+                                          device=device)], dim=1)
+            occ_end = occ_end.reshape(b, cnum, r)
+        occ = (occ_end - lo.unsqueeze(2)).clamp(min=0)
+        return lo, occ, cnt
 
     def expand(self, cont: torch.Tensor, occ_count: torch.Tensor,
                min_token_prob: float = 0.0) -> tuple[torch.Tensor,
                                                      torch.Tensor]:
-        return expand_chain(cont, occ_count, self.k,
-                            min_token_prob=min_token_prob)
+        chain, num_valid, _, _ = expand_chain(
+            cont, occ_count, self.k, min_token_prob=min_token_prob)
+        return chain, num_valid
