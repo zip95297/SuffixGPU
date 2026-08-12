@@ -1,8 +1,10 @@
 """SuffixGPUDrafter: orchestrates local + global drafting.
 
 The local path matches each request's own history; the global path
-matches a cross-request suffix index over finished responses. The two
-candidates are scored by (match_len, occurrence_count) per request.
+matches a cross-request suffix index over finished responses. Both
+paths draft with multi-length backoff (``num_backoff`` candidate
+lengths each) and the two winners compete by arctic-style score
+(sum of per-depth chain probabilities).
 
 Draft length is adaptive, mirroring arctic_inference SuffixDecoding:
 each candidate chain is truncated to
@@ -42,6 +44,7 @@ class SuffixGPUDrafter:
         max_spec_factor: float | None = None,
         max_spec_offset: float = 0.0,
         min_token_prob: float = 0.0,
+        num_backoff: int = 4,
     ):
         self.k = k
         self.device = torch.device(device)
@@ -49,6 +52,22 @@ class SuffixGPUDrafter:
         self.max_spec_factor = max_spec_factor
         self.max_spec_offset = max_spec_offset
         self.min_token_prob = min_token_prob
+        self.num_backoff = max(1, int(num_backoff))
+        # Local candidates: support thresholds 2^0 .. 2^(C-1) (arctic's
+        # length/support Pareto frontier gets denser as C grows).
+        support_thresholds = tuple(
+            2 ** i for i in range(self.num_backoff))
+        # Global candidates: capped lengths halving from the full
+        # pattern length, plus a final 2. Distinct values saturate at
+        # ~log2(max_pattern_len), so very large C stops adding caps.
+        if self.num_backoff == 1:
+            caps = [max_pattern_len]
+        else:
+            caps = [max(2, max_pattern_len >> i)
+                    for i in range(self.num_backoff - 1)] + [2]
+        caps = sorted(set(caps), reverse=True)
+        self._global_caps = torch.tensor(caps, dtype=torch.int64,
+                                         device=self.device)
         self.local_kernel = LocalMatchKernel(
             k=k,
             max_pattern_len=max_pattern_len,
@@ -57,6 +76,7 @@ class SuffixGPUDrafter:
             min_token_prob=min_token_prob,
             max_spec_factor=max_spec_factor,
             max_spec_offset=max_spec_offset,
+            support_thresholds=support_thresholds,
         ).to(self.device)
         self.global_index: GlobalIndex | None = None
         self._ingested: dict = {}
@@ -210,7 +230,8 @@ class SuffixGPUDrafter:
                 tails.to(torch.int32), tail_len, self.max_pattern_len,
                 self.k, min_token_prob=self.min_token_prob,
                 max_spec_factor=self.max_spec_factor,
-                max_spec_offset=self.max_spec_offset)
+                max_spec_offset=self.max_spec_offset,
+                caps=self._global_caps)
 
             pick_global = (g_score > local_score) & combined_mask
             draft = torch.where(pick_global.unsqueeze(1),

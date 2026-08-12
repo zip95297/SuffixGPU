@@ -17,39 +17,44 @@ whose continuations agree. Arctic walks every match length and keeps the
 best-scored draft; matching only the longest length systematically
 under-drafts on counter/templated traffic.
 
-Implementation notes (all pure torch ops, static loop bounds):
+Implementation notes (all pure torch ops, static loop bounds; every
+candidate rides the same batched kernels, so the marginal cost of an
+extra support threshold is small):
 - One pass computes match_back[i]: the length of the longest common
   suffix between the tokens ending at i (exclusive) and the request
   tail. A window of length L starting at pos matches the length-L tail
   iff match_back[pos + L] >= L.
-- Candidate lengths come from the occurrence-count table
-  cnt(L) = #{i : match_back[i] >= L}: for each support threshold t in
-  ``support_thresholds`` take the largest L with cnt(L) >= t.
-- Each candidate extracts its occurrences with one topk (earliest
-  positions first), expands a chain, and is scored by score_chain with
-  the adaptive cap floor(max_spec_factor * L + max_spec_offset).
+- The candidate for support threshold t is the largest L with
+  cnt(L) = #{i : match_back[i] >= L} >= t, which is exactly the t-th
+  largest match_back value: one topk over match_back yields every
+  candidate at once.
+- All candidates extract their earliest occurrences together with one
+  batched smallest-k topk over position keys, gather continuations in
+  one shot, and share a single fused expand+score call capped by
+  floor(max_spec_factor * L + max_spec_offset).
 """
 
 from __future__ import annotations
+
+from collections.abc import Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from suffix_gpu import triton_kernels
-from suffix_gpu.expand import expand_chain, score_chain
+from suffix_gpu.expand import expand_chain
 
 
 class LocalMatchKernel(nn.Module):
     """Multi-length local suffix matcher with score-ranked expansion."""
 
-    SUPPORT_THRESHOLDS = (1, 2, 4, 8)
-
     def __init__(self, k: int, max_pattern_len: int = 32,
                  min_match_len: int = 1, max_occurrences: int = 32,
                  min_token_prob: float = 0.0,
                  max_spec_factor: float | None = None,
-                 max_spec_offset: float = 0.0):
+                 max_spec_offset: float = 0.0,
+                 support_thresholds: Sequence[int] = (1, 2, 4, 8)):
         super().__init__()
         self.k = k
         self.max_pattern_len = max_pattern_len
@@ -58,6 +63,13 @@ class LocalMatchKernel(nn.Module):
         self.min_token_prob = min_token_prob
         self.max_spec_factor = max_spec_factor
         self.max_spec_offset = max_spec_offset
+        self.support_thresholds = tuple(int(t) for t in support_thresholds)
+        if not self.support_thresholds:
+            raise ValueError("support_thresholds must be non-empty")
+        self.register_buffer(
+            "_thresholds",
+            torch.tensor(self.support_thresholds, dtype=torch.int64),
+            persistent=False)
 
     def _spec_cap(self, match_len: torch.Tensor) -> torch.Tensor:
         if self.max_spec_factor is None:
@@ -122,63 +134,67 @@ class LocalMatchKernel(nn.Module):
         valid_i = pos.unsqueeze(0) < q_len.unsqueeze(1).to(torch.int32)
         mb = torch.where(valid_i, mb, torch.zeros_like(mb))
 
-        # Occurrence-count table cnt[b, L-1] = #{i : mb[b, i] >= L}.
-        levels = torch.arange(1, p + 1, dtype=torch.int32, device=device)
-        cnt = (mb.unsqueeze(2) >= levels.view(1, 1, p)).sum(dim=1)
-
-        # Candidate lengths: for each support threshold, the largest L
-        # with at least that many occurrences.
-        lvl = levels.to(torch.int64).view(1, p)
-        cand_lens = []
-        for t in self.SUPPORT_THRESHOLDS:
-            ok = cnt >= t
-            lc = (ok.to(torch.int64) * lvl).max(dim=1).values
-            cand_lens.append(lc)
-        cand = torch.stack(cand_lens, dim=1)  # [B, C]
+        # Candidate lengths: the largest L with cnt(L) >= t occurrences
+        # is exactly the t-th largest match_back value (cnt(L) =
+        # #{i : mb[i] >= L} is non-increasing in L), so one topk over
+        # mb yields every support threshold's candidate at once.
+        if self._thresholds.device != device:
+            self._thresholds = self._thresholds.to(device)
+        w_thr = min(max(self.support_thresholds), s)
+        top_mb = torch.topk(mb, w_thr, dim=1).values  # [B, w] descending
+        tidx = (self._thresholds - 1).clamp(min=0, max=w_thr - 1)
+        cand = top_mb.gather(1, tidx.view(1, -1).expand(b, -1)).to(
+            torch.int64)
+        # Thresholds beyond the buffer width can never be met.
+        cand = torch.where(self._thresholds.view(1, -1) > w_thr,
+                           torch.zeros_like(cand), cand)
         cand = torch.where(
             (cand >= self.min_match_len) & combined_mask.unsqueeze(1),
             cand, torch.zeros_like(cand))
         c = cand.shape[1]
 
-        # Per-candidate occurrence extraction + continuation gather.
-        conts = []
-        occ_counts = []
-        for ci in range(c):
-            lc = cand[:, ci]
-            mask = valid_i & (mb >= lc.unsqueeze(1).to(torch.int32)) \
-                & (lc > 0).unsqueeze(1)
-            occ_count = torch.minimum(
-                mask.sum(dim=1),
-                torch.full((b,), r, dtype=torch.int64, device=device))
-            key = pos.unsqueeze(0) + (~mask).to(torch.int32) * (s + 1)
+        # Earliest occurrence end positions for all candidates: one
+        # early-exit scan kernel on CUDA, else one batched smallest-k
+        # topk over position keys (matching positions keep their
+        # position, others sort past the end).
+        if triton_kernels.available(mb, cand):
+            occ_end, occ_count = triton_kernels.first_occurrences(
+                mb, cand.reshape(b * c), c, r)
+            occ_end = occ_end.reshape(b, c, r)
+            occ_count = occ_count.reshape(b, c)
+        else:
+            mask = (valid_i.unsqueeze(1)
+                    & (mb.unsqueeze(1) >= cand.unsqueeze(2).to(torch.int32))
+                    & (cand > 0).unsqueeze(2))  # [B, C, S]
+            occ_count = mask.sum(dim=2).clamp(max=r)  # [B, C]
+            key = pos.view(1, 1, s) + (~mask).to(torch.int32) * (s + 1)
             width = min(r, s)
-            top = torch.topk(key, width, dim=1, largest=False).values.to(
-                torch.int64)
-            occ_end = torch.where(top <= s - 1, top,
-                                  torch.zeros_like(top))
+            top = torch.topk(key.reshape(b * c, s), width, dim=1,
+                             largest=False).values.to(torch.int64)
+            occ_end = torch.where(top <= s - 1, top, torch.zeros_like(top))
             if width < r:
                 occ_end = torch.cat(
-                    [occ_end, torch.zeros(b, r - width, dtype=torch.int64,
+                    [occ_end, torch.zeros(b * c, r - width,
+                                          dtype=torch.int64,
                                           device=device)], dim=1)
-            offs_k = torch.arange(k, dtype=torch.int64, device=device)
-            idx = occ_end.unsqueeze(2) + offs_k
-            row_active = (
-                torch.arange(r, device=device).unsqueeze(0) <
-                occ_count.unsqueeze(1)).unsqueeze(2)
-            valid_idx = (idx < q_len.unsqueeze(1).unsqueeze(2)) & row_active
-            vals = token_ids.gather(
-                1, idx.clamp(0, s - 1).reshape(b, r * k)).reshape(b, r, k)
-            conts.append(torch.where(valid_idx, vals, -1))
-            occ_counts.append(occ_count)
+            occ_end = occ_end.reshape(b, c, r)
 
-        cont_all = torch.stack(conts, dim=1).reshape(b * c, r, k)
-        occ_all = torch.stack(occ_counts, dim=1).reshape(b * c)
+        # Continuation gather for all candidates in one shot.
+        offs_k = torch.arange(k, dtype=torch.int64, device=device)
+        idx = occ_end.unsqueeze(3) + offs_k  # [B, C, R, K]
+        row_active = (torch.arange(r, device=device).view(1, 1, r)
+                      < occ_count.unsqueeze(2)).unsqueeze(3)
+        valid_idx = (idx < q_len.view(b, 1, 1, 1)) & row_active
+        vals = token_ids.gather(
+            1, idx.clamp(0, s - 1).reshape(b, c * r * k)).reshape(
+                b, c, r, k)
+        cont_all = torch.where(valid_idx, vals, -1).reshape(b * c, r, k)
+        occ_all = occ_count.reshape(b * c)
 
-        chain, num_valid = expand_chain(
-            cont_all, occ_all, k, min_token_prob=self.min_token_prob)
         cap = self._spec_cap(cand.reshape(b * c))
-        num_emit, score = score_chain(cont_all, occ_all, chain, num_valid,
-                                      cap=cap)
+        chain, _, num_emit, score = expand_chain(
+            cont_all, occ_all, k, min_token_prob=self.min_token_prob,
+            cap=cap)
 
         score = score.reshape(b, c)
         num_emit = num_emit.reshape(b, c)
@@ -196,7 +212,8 @@ class LocalMatchKernel(nn.Module):
         sel_occ = occ_all[bidx, best]
         sel_score = score[bidx, best]
 
-        slot = torch.arange(k, device=device).unsqueeze(0)
-        sel_chain = torch.where(slot < sel_emit.unsqueeze(1), sel_chain, -1)
+        slot_k = torch.arange(k, device=device).unsqueeze(0)
+        sel_chain = torch.where(slot_k < sel_emit.unsqueeze(1), sel_chain,
+                                -1)
         return (sel_chain.to(torch.int32), sel_emit.to(torch.int32),
                 sel_len, sel_occ, sel_score)

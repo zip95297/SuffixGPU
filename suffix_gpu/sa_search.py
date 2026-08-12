@@ -107,18 +107,19 @@ def search_interval(
     return lo[:b], lo[b:]
 
 
-def longest_suffix_match(
+def suffix_match_backoff(
     sa: torch.Tensor,
     corpus: torch.Tensor,
     query: torch.Tensor,
     query_len: torch.Tensor,
     max_len: int,
+    caps: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Longest suffix of each query that occurs in the corpus.
+    """Longest suffix match per capped length, from one SA walk.
 
-    All candidate lengths 1..max_len are searched as one flattened
-    batch (B * max_len rows) in a single interval search, then the
-    longest non-empty interval is selected per query.
+    Equivalent to one longest_suffix_match call per cap, but the
+    interval search over lengths 1..max_len runs once; each cap then
+    just selects the longest non-empty interval among lengths <= cap.
 
     Args:
         sa: suffix array [n] i64.
@@ -126,9 +127,10 @@ def longest_suffix_match(
         query: padded query rows [B, Q] int.
         query_len: valid query lengths [B] i64.
         max_len: maximum match length to consider.
+        caps: [C] i64 per-candidate length caps (each <= max_len).
 
     Returns:
-        (match_len [B] i64, start [B] i64, end [B] i64) where
+        (match_len [B, C] i64, start [B, C] i64, end [B, C] i64) where
         [start, end) is the SA interval at the matched length; (0, 0)
         when there is no match.
     """
@@ -150,10 +152,34 @@ def longest_suffix_match(
     start = start.view(b, m)
     end = end.view(b, m)
     found = (end > start) & (lengths.view(1, m) <= query_len.view(b, 1))
-    best = (found.to(torch.int64) * lengths.view(1, m)).max(dim=1).values
-    pick = (best - 1).clamp(min=0).unsqueeze(1)
-    s_best = start.gather(1, pick).squeeze(1)
-    e_best = end.gather(1, pick).squeeze(1)
+    found_len = found.to(torch.int64) * lengths.view(1, m)
+    within = lengths.view(1, 1, m) <= caps.view(1, -1, 1)
+    best = (found_len.unsqueeze(1) * within).amax(dim=2)  # [B, C]
+    pick = (best - 1).clamp(min=0)
+    s_best = start.gather(1, pick)
+    e_best = end.gather(1, pick)
     zero = torch.zeros_like(s_best)
     return (best, torch.where(best > 0, s_best, zero),
             torch.where(best > 0, e_best, zero))
+
+
+def longest_suffix_match(
+    sa: torch.Tensor,
+    corpus: torch.Tensor,
+    query: torch.Tensor,
+    query_len: torch.Tensor,
+    max_len: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Longest suffix of each query that occurs in the corpus.
+
+    Single-cap special case of suffix_match_backoff.
+
+    Returns:
+        (match_len [B] i64, start [B] i64, end [B] i64) where
+        [start, end) is the SA interval at the matched length; (0, 0)
+        when there is no match.
+    """
+    caps = torch.full((1,), max_len, dtype=torch.int64, device=sa.device)
+    best, start, end = suffix_match_backoff(
+        sa, corpus, query, query_len, max_len, caps)
+    return best[:, 0], start[:, 0], end[:, 0]
