@@ -318,7 +318,7 @@ def run_accuracy(args, device: torch.device) -> None:
                 continue
             drafter = SuffixGPUDrafter(
                 k=args.k, device=device, max_pattern_len=args.depth,
-                min_match_len=1, max_occurrences=32,
+                min_match_len=1,
                 enable_global=enable_global,
                 global_capacity=1 << 20, delta_capacity=1 << 15,
                 max_spec_factor=args.spec_factor,
