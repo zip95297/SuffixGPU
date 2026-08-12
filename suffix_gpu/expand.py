@@ -2,7 +2,8 @@
 
 Shared by the local matcher and the global index: given a per-request
 matrix of continuation sequences (one row per occurrence of the matched
-pattern), build the draft chain by depth-wise majority vote.
+pattern), build the draft chain by depth-wise majority vote and score
+it arctic-style in the same pass.
 """
 
 from __future__ import annotations
@@ -52,8 +53,16 @@ def expand_chain(
     k: int,
     sentinel: int = -1,
     min_token_prob: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build a draft chain by depth-wise majority vote over continuations.
+    cap: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Majority-vote chain expansion with fused arctic-style scoring.
+
+    The expansion already tracks the cumulative chain probability
+    (product of per-depth vote fractions) for the ``min_token_prob``
+    cutoff; the arctic draft score is the sum of exactly those values
+    over emitted depths (``score += prob``), so it is accumulated here
+    instead of in a separate replay pass. Chain validity is monotone,
+    hence depth d is emitted iff it is valid and ``d < cap``.
 
     Args:
         cont: [B, R, k] int tensor of continuation tokens; row r of
@@ -67,21 +76,29 @@ def expand_chain(
             (product of per-depth vote fractions, mirroring
             child.count / node.count on a suffix tree) drops below this
             threshold. 0 disables the cutoff.
+        cap: optional [B] max tokens to emit (adaptive spec cap);
+            emission stops at min(num_valid, cap). None means k.
 
     Returns:
-        (chain [B, k] int, num_valid [B] int64): the majority-vote
-        chain and the count of leading valid tokens per request.
+        (chain [B, k] int, num_valid [B] i64, num_emit [B] i64,
+         score [B] f32): the majority-vote chain (uncapped), its count
+        of leading valid tokens, the capped emission count, and the
+        summed chain probability over emitted depths.
     """
     b, r, _ = cont.shape
     device = cont.device
+    if cap is None:
+        cap = torch.full((b,), k, dtype=torch.int64, device=device)
+    cap = cap.to(torch.int64)
     if sentinel == -1 and triton_kernels.available(cont, num_occ):
         return triton_kernels.expand_chain(cont, num_occ, k,
-                                           min_token_prob)
+                                           min_token_prob, cap)
     offs = torch.arange(r, device=device)
     active = offs.unsqueeze(0) < num_occ.unsqueeze(1)
     chain = torch.full((b, k), sentinel, dtype=cont.dtype, device=device)
     prefix_ok = active.clone()
     cum_prob = torch.ones(b, dtype=torch.float32, device=device)
+    score = torch.zeros(b, dtype=torch.float32, device=device)
     for d in range(k):
         active_d = prefix_ok & (cont[:, :, d] != sentinel)
         tok, cnt = _majority_token(cont[:, :, d], active_d, sentinel)
@@ -90,6 +107,8 @@ def expand_chain(
                                / n_active.to(torch.float32))
         valid = (tok != sentinel) & (cum_prob >= min_token_prob)
         chain[:, d] = torch.where(valid, tok, chain[:, d])
+        score = score + torch.where(valid & (cap > d), cum_prob,
+                                    torch.zeros_like(cum_prob))
         prefix_ok = (
             prefix_ok
             & (cont[:, :, d] == tok.unsqueeze(1))
@@ -98,4 +117,5 @@ def expand_chain(
     # Chain validity is monotone: once a slot is sentinel, the rest are.
     filled = (chain != sentinel).to(torch.int64)
     num_valid = torch.cumprod(filled, dim=1).sum(dim=1)
-    return chain, num_valid
+    num_emit = torch.minimum(num_valid, cap.clamp(min=0))
+    return chain, num_valid, num_emit, score

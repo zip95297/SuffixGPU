@@ -15,20 +15,21 @@ composes with async scheduling and CUDA-graph capture.
   `propose_with_update` never sync to the host; all shapes are static and
   loop bounds are fixed, keeping the hot path `torch.compile`- and
   CUDA-graph-friendly.
-- **Variable-length suffix matching.** Per-request longest-suffix self-match
-  (single-pass rolling AND + one `topk`), following vLLM `NgramGPUKernel`
-  occurrence semantics.
-- **Frequency-ranked expansion.** Depth-wise majority vote over matched
-  continuations with an adaptive stop rule (`max_spec_factor`,
-  `max_spec_offset`, `min_token_prob`) matching Arctic/SuffixDecoding
-  semantics.
+- **Multi-length backoff matching.** Per-request self-match considers the
+  longest suffix plus shorter, better-supported lengths (`num_backoff`
+  candidates from one match_back pass); the global path probes the same
+  ladder of capped lengths from a single SA walk.
+- **Score-ranked expansion.** Depth-wise majority vote over matched
+  continuations with fused arctic-style scoring (sum of per-depth chain
+  probabilities) and an adaptive stop rule (`max_spec_factor`,
+  `max_spec_offset`, `min_token_prob`); the best-scored candidate wins.
 - **Cross-request global memory.** Finished (or in-flight) sequences are
   ingested into a corpus ring + append-only delta buffer. The suffix array is
   rebuilt on a **side CUDA stream, double-buffered**, and swapped in-place so
   tensor identity is preserved for captured CUDA graphs.
 - **Fused Triton kernels** for the hot path (`match_back`, `sa_search`,
-  `expand_chain`, `scatter_append`) with pure-PyTorch fallbacks — the package
-  runs on CPU / CUDA / MPS without Triton.
+  `expand_chain`, `first_occurrences`, `scatter_append`) with pure-PyTorch
+  fallbacks — the package runs on CPU / CUDA / MPS without Triton.
 - **int32 intermediates** on the dominant `[B, S]` buffers to cut memory
   traffic.
 
@@ -103,33 +104,40 @@ when you manage state updates yourself.
 | `rebuild_stream` | `None` | CUDA stream for background rebuilds |
 | `max_spec_factor` / `max_spec_offset` | `None` / `0.0` | Adaptive draft-length cap: `factor * match_len + offset` |
 | `min_token_prob` | `0.0` | Cumulative-probability cutoff during expansion |
+| `num_backoff` | `4` | Candidate match lengths per path: local support thresholds `2^0..2^(C-1)`, global capped lengths halving from `max_pattern_len` (plus a final 2; distinct caps saturate at ~log2 of the pattern length). `1` = longest match only; larger values probe more lengths at small marginal cost |
 
 ## How it works
 
 ```
                     ┌────────────────────────────────────────────┐
- token_ids [B,S] ──►│ 1. local match      longest suffix of each │
- num_tokens [B]     │    (local_matcher)  request in its own ctx │
+ token_ids [B,S] ──►│ 1. local match      backoff candidate      │
+ num_tokens [B]     │    (local_matcher)  lengths in own ctx     │
                     │ 2. global match     SA interval search +   │
                     │    (sa_search /     delta brute-force scan │
-                    │     global_index)                          │
-                    │ 3. expand           depth-wise majority    │
-                    │    (expand)         vote + adaptive stop   │
+                    │     global_index)   at capped lengths      │
+                    │ 3. expand + score   majority vote, fused   │
+                    │    (expand)         score, best wins       │
                     └────────────────┬───────────────────────────┘
                                      ▼
                         draft [B,k], num_valid [B]
 ```
 
-1. **Local matching** — for each request, find the longest suffix of its
-   generated tokens that reoccurs earlier in the same context, collecting up
-   to `max_occurrences` continuation sites in one pass.
+1. **Local matching** — for each request, one match_back pass over its own
+   context yields `num_backoff` candidate suffix lengths (for support
+   threshold t, the largest length occurring ≥ t times — the t-th largest
+   match_back value), each with up to `max_occurrences` earliest
+   continuation sites.
 2. **Global matching** — the same tail is searched in the shared corpus via
    fixed-iteration binary search on the suffix array (all pattern lengths
-   `1..max_pattern_len` as one flattened batch), plus a brute-force scan of
-   the not-yet-indexed delta buffer.
-3. **Expansion** — continuations are extended depth by depth; each step takes
-   the majority token across occurrences and tracks an empirical chain
-   probability used for the adaptive stop rule.
+   `1..max_pattern_len` as one flattened batch, each backoff cap selecting
+   its longest hit from the same walk), plus one brute-force scan of the
+   not-yet-indexed delta buffer serving every cap.
+3. **Expansion & selection** — all candidates share one fused expand+score
+   kernel: continuations are extended depth by depth by majority vote,
+   tracking the empirical chain probability for the adaptive stop rule and
+   summing it into the arctic-style score (expected accepted tokens). The
+   best-scored candidate wins per path, and the local/global winners
+   compete by the same score.
 4. **Global index maintenance** — new documents append to the delta; when it
    fills past `rebuild_threshold`, a fresh suffix array is built on a side
    stream over a staging corpus and event-poll swapped in without touching
@@ -198,6 +206,13 @@ Every module is tested against the naive references in
 `mps`. `tests/test_verification.py` additionally fuzzes end-to-end
 draft/verify equivalence against `arctic-inference` (skipped automatically if
 the package is not installed).
+
+## TODO
+
+- **Global tree save & load interface** — persist the cross-request global
+  memory (corpus ring + suffix array + delta buffer) to disk and restore it
+  across sessions, so the accumulated suffix statistics survive restarts
+  instead of being rebuilt from scratch.
 
 ## References
 

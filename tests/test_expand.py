@@ -50,7 +50,7 @@ def test_expand_chain_exact(device):
     cont = torch.tensor([[[4, 5, 6], [4, 7, 8]]], dtype=torch.int32,
                         device=device)
     num_occ = torch.tensor([2], dtype=torch.int64, device=device)
-    chain, nv = expand_chain(cont, num_occ, 3)
+    chain, nv, _, _ = expand_chain(cont, num_occ, 3)
     assert chain.tolist() == [[4, 5, 6]]
     assert nv.tolist() == [3]
 
@@ -61,7 +61,7 @@ def test_expand_chain_prefix_filtering(device):
     cont = torch.tensor([[[4, 5, -1], [3, 9, 2]]], dtype=torch.int32,
                         device=device)
     num_occ = torch.tensor([2], dtype=torch.int64, device=device)
-    chain, nv = expand_chain(cont, num_occ, 3)
+    chain, nv, _, _ = expand_chain(cont, num_occ, 3)
     assert chain.tolist() == [[3, 9, 2]]
     assert nv.tolist() == [3]
 
@@ -70,7 +70,7 @@ def test_expand_chain_truncation(device):
     cont = torch.tensor([[[4, -1, -1], [4, 1, -1]]], dtype=torch.int32,
                         device=device)
     num_occ = torch.tensor([2], dtype=torch.int64, device=device)
-    chain, nv = expand_chain(cont, num_occ, 3)
+    chain, nv, _, _ = expand_chain(cont, num_occ, 3)
     assert chain.tolist() == [[4, 1, -1]]
     assert nv.tolist() == [2]
 
@@ -78,6 +78,6 @@ def test_expand_chain_truncation(device):
 def test_expand_chain_zero_occ(device):
     cont = torch.full((2, 3, 4), -1, dtype=torch.int32, device=device)
     num_occ = torch.tensor([0, 0], dtype=torch.int64, device=device)
-    chain, nv = expand_chain(cont, num_occ, 4)
+    chain, nv, _, _ = expand_chain(cont, num_occ, 4)
     assert (chain == -1).all()
     assert nv.tolist() == [0, 0]

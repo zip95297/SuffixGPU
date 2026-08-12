@@ -182,10 +182,11 @@ def test_delta_occurrence_positions_compacted(device):
     q = torch.tensor([[7, 7] + [0] * (P - 2)], dtype=torch.int32,
                      device=device)
     qlen = torch.tensor([2], dtype=torch.int64, device=device)
-    d_len, d_pos, d_cnt = idx._delta_match(q, qlen, P)
-    assert d_len[0].item() == 2
-    assert d_cnt[0].item() == 3
-    assert d_pos[0, :3].tolist() == [1, 10, 19]
+    caps = torch.full((1,), P, dtype=torch.int64, device=device)
+    d_len, d_pos, d_cnt = idx._delta_match_backoff(q, qlen, P, caps)
+    assert d_len[0, 0].item() == 2
+    assert d_cnt[0, 0].item() == 3
+    assert d_pos[0, 0, :3].tolist() == [1, 10, 19]
 
     chain, mlen, occ = _query(idx, [7, 7], device)
     exp_chain, exp_len = _naive_chain(doc, [7, 7], K, P)

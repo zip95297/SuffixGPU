@@ -266,15 +266,21 @@ def run_replay(args, device: torch.device, data) -> None:
         for enable_global, use_graph, tag in variants:
             if use_graph and device.type != "cuda":
                 continue
+            extra = {}
+            if args.max_occurrences is not None:
+                extra["max_occurrences"] = args.max_occurrences
+            if args.num_backoff is not None:
+                extra["num_backoff"] = args.num_backoff
             drafter = SuffixGPUDrafter(
                 k=args.k, device=device, max_pattern_len=args.depth,
-                min_match_len=1, max_occurrences=32,
+                min_match_len=1,
                 enable_global=enable_global,
                 global_capacity=1 << 20, delta_capacity=1 << 15,
                 max_spec_factor=args.spec_factor,
                 min_token_prob=args.min_token_prob,
                 rebuild_stream=torch.cuda.Stream(device)
                 if device.type == "cuda" else None,
+                **extra,
             )
             for w in range(args.waves):
                 r = replay_gpu(drafter, items, device,
@@ -300,11 +306,17 @@ def run_agreement(args, device: torch.device, data) -> None:
 
         cache = SuffixDecodingCache(max_tree_depth=args.depth,
                                     max_cached_requests=1000)
+        extra = {}
+        if args.max_occurrences is not None:
+            extra["max_occurrences"] = args.max_occurrences
+        if args.num_backoff is not None:
+            extra["num_backoff"] = args.num_backoff
         drafter = SuffixGPUDrafter(
             k=args.k, device=device, max_pattern_len=args.depth,
-            min_match_len=1, max_occurrences=32, enable_global=False,
+            min_match_len=1, enable_global=False,
             max_spec_factor=args.spec_factor,
-            min_token_prob=args.min_token_prob)
+            min_token_prob=args.min_token_prob,
+            **extra)
 
         buf = torch.zeros((b, s_buf), dtype=torch.int32, device=device)
         for i, (p, _) in enumerate(items):
@@ -411,14 +423,20 @@ def run_scale(args, device: torch.device, data) -> None:
         del cache
 
         # --- GPU: same warm state ---
+        extra = {}
+        if args.max_occurrences is not None:
+            extra["max_occurrences"] = args.max_occurrences
+        if args.num_backoff is not None:
+            extra["num_backoff"] = args.num_backoff
         drafter = SuffixGPUDrafter(
             k=args.k, device=device, max_pattern_len=args.depth,
-            min_match_len=1, max_occurrences=32, enable_global=True,
+            min_match_len=1, enable_global=True,
             global_capacity=1 << 20, delta_capacity=1 << 16,
             max_spec_factor=args.spec_factor,
             min_token_prob=args.min_token_prob,
             rebuild_stream=torch.cuda.Stream(device)
-            if device.type == "cuda" else None)
+            if device.type == "cuda" else None,
+            **extra)
         rows = [torch.tensor(streams[i][prompt_lens[i]:],
                              dtype=torch.int32, device=device)
                 for i in range(b)]
@@ -483,6 +501,10 @@ def main() -> None:
     ap.add_argument("--scale-batches", type=lambda s: [int(x) for x in
                     s.split(",")], default=[8, 32, 128, 256, 512])
     ap.add_argument("--scale-iters", type=int, default=20)
+    ap.add_argument("--max-occurrences", type=int, default=None,
+                    help="override drafter max_occurrences (default: class default)")
+    ap.add_argument("--num-backoff", type=int, default=None,
+                    help="override drafter num_backoff (default: class default)")
     args = ap.parse_args()
 
     from transformers import AutoTokenizer

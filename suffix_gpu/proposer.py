@@ -1,8 +1,10 @@
 """SuffixGPUDrafter: orchestrates local + global drafting.
 
 The local path matches each request's own history; the global path
-matches a cross-request suffix index over finished responses. The two
-candidates are scored by (match_len, occurrence_count) per request.
+matches a cross-request suffix index over finished responses. Both
+paths draft with multi-length backoff (``num_backoff`` candidate
+lengths each) and the two winners compete by arctic-style score
+(sum of per-depth chain probabilities).
 
 Draft length is adaptive, mirroring arctic_inference SuffixDecoding:
 each candidate chain is truncated to
@@ -16,7 +18,6 @@ from __future__ import annotations
 import torch
 
 from suffix_gpu import triton_kernels
-from suffix_gpu.expand import expand_chain
 from suffix_gpu.global_index import GlobalIndex
 from suffix_gpu.local_matcher import LocalMatchKernel
 
@@ -43,6 +44,7 @@ class SuffixGPUDrafter:
         max_spec_factor: float | None = None,
         max_spec_offset: float = 0.0,
         min_token_prob: float = 0.0,
+        num_backoff: int = 4,
     ):
         self.k = k
         self.device = torch.device(device)
@@ -50,12 +52,31 @@ class SuffixGPUDrafter:
         self.max_spec_factor = max_spec_factor
         self.max_spec_offset = max_spec_offset
         self.min_token_prob = min_token_prob
+        self.num_backoff = max(1, int(num_backoff))
+        # Local candidates: support thresholds 2^0 .. 2^(C-1) (arctic's
+        # length/support Pareto frontier gets denser as C grows).
+        support_thresholds = tuple(
+            2 ** i for i in range(self.num_backoff))
+        # Global candidates: capped lengths halving from the full
+        # pattern length, plus a final 2. Distinct values saturate at
+        # ~log2(max_pattern_len), so very large C stops adding caps.
+        if self.num_backoff == 1:
+            caps = [max_pattern_len]
+        else:
+            caps = [max(2, max_pattern_len >> i)
+                    for i in range(self.num_backoff - 1)] + [2]
+        caps = sorted(set(caps), reverse=True)
+        self._global_caps = torch.tensor(caps, dtype=torch.int64,
+                                         device=self.device)
         self.local_kernel = LocalMatchKernel(
             k=k,
             max_pattern_len=max_pattern_len,
             min_match_len=min_match_len,
             max_occurrences=max_occurrences,
             min_token_prob=min_token_prob,
+            max_spec_factor=max_spec_factor,
+            max_spec_offset=max_spec_offset,
+            support_thresholds=support_thresholds,
         ).to(self.device)
         self.global_index: GlobalIndex | None = None
         self._ingested: dict = {}
@@ -86,16 +107,6 @@ class SuffixGPUDrafter:
         tails = torch.where(
             valid, token_ids_gpu.gather(1, idx.clamp(0, s - 1)), 0)
         return tails, tail_len
-
-    def _clamp_spec(self, num_valid: torch.Tensor,
-                    match_len: torch.Tensor) -> torch.Tensor:
-        """Adaptive cap: factor * match_len + offset (arctic semantics)."""
-        if self.max_spec_factor is None:
-            return num_valid
-        limit = (self.max_spec_factor * match_len.to(torch.float32)
-                 + self.max_spec_offset).floor().to(torch.int64)
-        limit = limit.clamp(min=0)
-        return torch.minimum(num_valid.to(torch.int64), limit)
 
     def poll(self) -> None:
         """Host-side: swap in a finished background rebuild, if any.
@@ -206,27 +217,23 @@ class SuffixGPUDrafter:
         if combined_mask is None:
             combined_mask = torch.ones(
                 b, dtype=torch.bool, device=self.device)
-        local_draft, local_nv, local_len, local_occ = self.local_kernel(
+        (local_draft, local_nv, local_len, local_occ,
+         local_score) = self.local_kernel(
             num_tokens_no_spec, token_ids_gpu, combined_mask)
-        local_nv = self._clamp_spec(local_nv, local_len)
 
         if self.global_index is None:
             draft, num_valid = local_draft, local_nv
         else:
             tails, tail_len = self._gather_tails(num_tokens_no_spec,
                                                  token_ids_gpu)
-            g_len, cont, occ_cnt = self.global_index.query(
-                tails.to(torch.int32), tail_len, self.max_pattern_len)
-            g_chain, g_nv = expand_chain(
-                cont, occ_cnt, self.k, min_token_prob=self.min_token_prob)
-            g_chain = torch.where(g_len.unsqueeze(1) > 0, g_chain, -1)
-            g_nv = torch.where(g_len > 0, g_nv, torch.zeros_like(g_nv))
-            g_nv = self._clamp_spec(g_nv, g_len)
+            g_chain, g_nv, g_len, g_occ, g_score = self.global_index.draft(
+                tails.to(torch.int32), tail_len, self.max_pattern_len,
+                self.k, min_token_prob=self.min_token_prob,
+                max_spec_factor=self.max_spec_factor,
+                max_spec_offset=self.max_spec_offset,
+                caps=self._global_caps)
 
-            pick_global = ((g_len > local_len.to(torch.int64))
-                           | ((g_len == local_len.to(torch.int64))
-                              & (occ_cnt > local_occ)
-                              & (g_len > 0))) & combined_mask
+            pick_global = (g_score > local_score) & combined_mask
             draft = torch.where(pick_global.unsqueeze(1),
                                 g_chain.to(torch.int32), local_draft)
             num_valid = torch.where(pick_global, g_nv.to(torch.int64),
