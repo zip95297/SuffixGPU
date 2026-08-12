@@ -27,7 +27,7 @@ from collections import deque
 import torch
 
 from suffix_gpu import triton_kernels
-from suffix_gpu.expand import expand_chain
+from suffix_gpu.expand import expand_chain, score_chain
 from suffix_gpu.sa_search import longest_suffix_match
 from suffix_gpu.suffix_array import build_suffix_array
 
@@ -316,6 +316,71 @@ class GlobalIndex:
         occ_count = torch.where(use_sa, sa_cnt,
                                 torch.where(use_delta, d_cnt, zero))
         return match_len, cont, occ_count
+
+    def draft(
+        self,
+        query: torch.Tensor,
+        query_len: torch.Tensor,
+        max_len: int,
+        k: int,
+        min_token_prob: float = 0.0,
+        max_spec_factor: float | None = None,
+        max_spec_offset: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor]:
+        """Multi-length scored draft over corpus + delta.
+
+        Queries at several capped match lengths (a shorter cap widens
+        the occurrence set), expands each candidate chain, scores it
+        arctic-style (sum of per-depth chain probabilities, capped by
+        floor(max_spec_factor * match_len + max_spec_offset)) and keeps
+        the best-scored candidate; exact ties prefer the longer match.
+
+        Returns:
+            (chain [B, k] int32, num_valid [B] int64, match_len [B] i64,
+             occ_count [B] i64, score [B] f32)
+        """
+        b = query.shape[0]
+        device = self.device
+        caps = sorted({max_len, max(2, max_len // 2), max(2, max_len // 4), 2},
+                      reverse=True)
+
+        best_chain = torch.full((b, k), -1, dtype=torch.int32, device=device)
+        best_emit = torch.zeros(b, dtype=torch.int64, device=device)
+        best_len = torch.zeros(b, dtype=torch.int64, device=device)
+        best_occ = torch.zeros(b, dtype=torch.int64, device=device)
+        best_score = torch.full((b,), -1.0, dtype=torch.float32,
+                                device=device)
+        for cap_len in caps:
+            match_len, cont, occ_count = self.query(query, query_len, cap_len)
+            chain, num_valid = expand_chain(
+                cont, occ_count, k, min_token_prob=min_token_prob)
+            chain = torch.where(match_len.unsqueeze(1) > 0, chain, -1)
+            num_valid = torch.where(match_len > 0, num_valid,
+                                    torch.zeros_like(num_valid))
+            if max_spec_factor is None:
+                cap = torch.full_like(match_len, k)
+            else:
+                cap = (max_spec_factor * match_len.to(torch.float32)
+                       + max_spec_offset).floor().to(torch.int64).clamp(min=0)
+            num_emit, score = score_chain(cont, occ_count, chain, num_valid,
+                                          cap=cap)
+            score = torch.where(match_len > 0, score, torch.zeros_like(score))
+            # Longer caps are evaluated first, so a strict > keeps the
+            # longer match on exact ties (arctic semantics).
+            take = score > best_score
+            best_chain = torch.where(take.unsqueeze(1),
+                                     chain.to(torch.int32), best_chain)
+            best_emit = torch.where(take, num_emit, best_emit)
+            best_len = torch.where(take, match_len, best_len)
+            best_occ = torch.where(take, occ_count, best_occ)
+            best_score = torch.where(take, score, best_score)
+
+        slot = torch.arange(k, device=device).unsqueeze(0)
+        best_chain = torch.where(slot < best_emit.unsqueeze(1), best_chain,
+                                 -1)
+        best_score = best_score.clamp(min=0.0)
+        return best_chain, best_emit, best_len, best_occ, best_score
 
     def _gather_cont(
         self,

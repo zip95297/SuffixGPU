@@ -22,7 +22,7 @@ def _run(kernel, seqs, device, mask=None):
         lens[i] = len(s)
     if mask is None:
         mask = torch.ones(b, dtype=torch.bool, device=device)
-    draft, nv, mlen, occ = kernel(lens, buf, mask)
+    draft, nv, mlen, occ, score = kernel(lens, buf, mask)
     return draft.cpu(), nv.cpu(), mlen.cpu()
 
 

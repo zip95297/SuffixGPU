@@ -99,3 +99,54 @@ def expand_chain(
     filled = (chain != sentinel).to(torch.int64)
     num_valid = torch.cumprod(filled, dim=1).sum(dim=1)
     return chain, num_valid
+
+
+def score_chain(
+    cont: torch.Tensor,
+    num_occ: torch.Tensor,
+    chain: torch.Tensor,
+    num_valid: torch.Tensor,
+    cap: torch.Tensor | None = None,
+    sentinel: int = -1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Arctic-style draft score: sum of per-depth chain probabilities.
+
+    Replays `chain` against the occurrence continuations and accumulates
+    the cumulative conditional vote fraction at each emitted depth
+    (mirrors arctic's ``score += prob`` along the speculated path, where
+    prob is the product of child.count / node.count hops).
+
+    Args:
+        cont: [B, R, k] continuation tokens, `sentinel` padded.
+        num_occ: [B] valid occurrence rows.
+        chain: [B, k] drafted tokens, `sentinel` padded.
+        num_valid: [B] leading valid token counts of `chain`.
+        cap: optional [B] max tokens to emit (adaptive spec cap);
+            emission stops at min(num_valid, cap).
+        sentinel: padding value.
+
+    Returns:
+        (num_emit [B] int64, score [B] float32): the capped emission
+        count and the summed chain probability over emitted depths.
+    """
+    b, r, k = cont.shape
+    device = cont.device
+    offs = torch.arange(r, device=device)
+    active = offs.unsqueeze(0) < num_occ.unsqueeze(1)
+    num_emit = num_valid.to(torch.int64)
+    if cap is not None:
+        num_emit = torch.minimum(num_emit, cap.to(torch.int64))
+    cum = torch.ones(b, dtype=torch.float32, device=device)
+    score = torch.zeros(b, dtype=torch.float32, device=device)
+    for d in range(k):
+        tok = chain[:, d]
+        real = cont[:, :, d] != sentinel
+        active_d = active & real
+        match = active_d & (cont[:, :, d] == tok.unsqueeze(1))
+        n_active = active_d.sum(dim=1).clamp(min=1)
+        frac = match.sum(dim=1).to(torch.float32) / n_active.to(torch.float32)
+        emitted = (d < num_emit) & (tok != sentinel)
+        cum = torch.where(emitted, cum * frac, cum)
+        score = score + torch.where(emitted, cum, torch.zeros_like(cum))
+        active = match
+    return num_emit, score
