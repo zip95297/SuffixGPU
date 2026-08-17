@@ -50,6 +50,9 @@ class GlobalIndex:
         rebuild_threshold: int | None = None,
         device: torch.device | str = "cpu",
         rebuild_stream: torch.cuda.Stream | None = None,
+        eviction: str = "fifo",
+        lfu_decay: float = 0.5,
+        lfu_protect_rebuilds: int = 1,
     ):
         self.capacity = capacity
         self.delta_capacity = delta_capacity
@@ -59,6 +62,11 @@ class GlobalIndex:
             1, delta_capacity // 2)
         self.device = torch.device(device)
         self.rebuild_stream = rebuild_stream
+        if eviction not in ("fifo", "lfu"):
+            raise ValueError(f"unknown eviction {eviction!r}")
+        self.eviction = eviction
+        self.lfu_decay = float(lfu_decay)
+        self.lfu_protect_rebuilds = int(lfu_protect_rebuilds)
 
         self.corpus = torch.full((capacity,), PAD_TOKEN, dtype=torch.int32,
                                  device=self.device)
@@ -72,13 +80,34 @@ class GlobalIndex:
                                  device=self.device)
         self.delta_len_t = torch.zeros((), dtype=torch.int64,
                                        device=self.device)
+        # Accepted-token credit per corpus/delta position (LFU only).
+        # Aggregated into per-document utilities at rebuild time.
+        if self.eviction == "lfu":
+            self.hit = torch.zeros(capacity, dtype=torch.float32,
+                                   device=self.device)
+            self.staging_hit = torch.zeros_like(self.hit)
+            self.hit_delta = torch.zeros(delta_capacity,
+                                         dtype=torch.float32,
+                                         device=self.device)
+        else:
+            self.hit = None
+            self.staging_hit = None
+            self.hit_delta = None
 
         self.active_len = 0
         self.delta_len = 0
         self.active_doc_lens: deque[int] = deque()
+        # Rebuilds each document has survived (parallel to
+        # active_doc_lens); documents younger than
+        # lfu_protect_rebuilds are exempt from LFU eviction.
+        self.active_doc_ages: deque[int] = deque()
         self.delta_doc_lens: list[int] = []
+        # Bumped whenever stored coordinates move (delta compaction /
+        # drop, active swap): externally cached positions must be
+        # dropped by the caller when the epoch changes.
+        self.position_epoch = 0
         self._rebuild_event: torch.cuda.Event | None = None
-        self._pending: tuple[int, deque[int]] | None = None
+        self._pending: tuple[int, deque[int], deque[int]] | None = None
 
     # ------------------------------------------------------------------
     # writes
@@ -128,9 +157,15 @@ class GlobalIndex:
         remaining = self.delta_len - acc
         if remaining > 0:
             self.delta[:remaining] = self.delta[acc:self.delta_len].clone()
+            if self.hit_delta is not None:
+                self.hit_delta[:remaining] = \
+                    self.hit_delta[acc:self.delta_len].clone()
+        if self.hit_delta is not None:
+            self.hit_delta[max(remaining, 0):].zero_()
         self.delta_len = remaining
         self.delta_len_t.fill_(remaining)
         self.delta_doc_lens = self.delta_doc_lens[docs_dropped:]
+        self.position_epoch += 1
 
     # ------------------------------------------------------------------
     # rebuild
@@ -144,17 +179,74 @@ class GlobalIndex:
             return
         self._launch_rebuild()
 
+    def _doc_utilities(self) -> torch.Tensor:
+        """Per-active-document accepted-credit sums (host tensor).
+
+        Small rebuild-path D2H copy; the query hot path never calls
+        this.
+        """
+        n_docs = len(self.active_doc_lens)
+        if n_docs == 0:
+            return torch.zeros(0)
+        lens = torch.tensor(list(self.active_doc_lens),
+                            dtype=torch.int64, device=self.device)
+        ends = torch.cumsum(lens, 0)
+        csum = torch.cat([
+            torch.zeros(1, dtype=torch.float32, device=self.device),
+            torch.cumsum(self.hit[:self.active_len], 0)])
+        util = csum[ends] - csum[ends - lens]
+        return util.cpu()
+
+    def _select_kept_docs(self) -> list[int]:
+        """Indices of active docs to keep (ascending), fitting
+        capacity - delta_len."""
+        n_docs = len(self.active_doc_lens)
+        lens = list(self.active_doc_lens)
+        budget = self.capacity - min(self.delta_len,
+                                     self.delta_capacity)
+        total = self.active_len
+        if total <= budget:
+            return list(range(n_docs))
+        if self.eviction == "fifo" or self.hit is None:
+            keep_start = 0
+            start = 0
+            for i, ln in enumerate(lens):
+                if total - start <= budget:
+                    break
+                start += ln
+                keep_start = i + 1
+            return list(range(keep_start, n_docs))
+        util = self._doc_utilities()
+        ages = list(self.active_doc_ages)
+        # Protected (young) docs sort last = evicted only if the
+        # unprotected pool cannot free enough space; ties among equal
+        # utility evict the oldest first.
+        order = sorted(
+            range(n_docs),
+            key=lambda i: (
+                1 if ages[i] < self.lfu_protect_rebuilds else 0,
+                float(util[i]),
+                -ages[i],
+            ))
+        kept = set(range(n_docs))
+        freed = 0
+        for i in order:
+            if total - freed <= budget:
+                break
+            kept.discard(i)
+            freed += lens[i]
+        return sorted(kept)
+
     def _launch_rebuild(self) -> None:
         if self._rebuild_event is not None:
             return
-        # Evict oldest whole docs until the snapshot fits into capacity.
-        keep_start = 0
-        for ln in self.active_doc_lens:
-            if self.active_len - keep_start + self.delta_len \
-                    <= self.capacity:
-                break
-            keep_start += ln
-        n_active_keep = self.active_len - keep_start
+        lens = list(self.active_doc_lens)
+        ages = list(self.active_doc_ages)
+        starts = [0] * len(lens)
+        for i in range(1, len(lens)):
+            starts[i] = starts[i - 1] + lens[i - 1]
+        kept = self._select_kept_docs()
+        n_active_keep = sum(lens[i] for i in kept)
         snap = min(self.delta_len, self.capacity - n_active_keep)
         # Clamp the snapshot to a whole-doc boundary in the delta.
         acc = 0
@@ -170,23 +262,51 @@ class GlobalIndex:
 
         dst = self.staging_corpus
         dst.fill_(PAD_TOKEN)
+        if self.staging_hit is not None:
+            self.staging_hit.zero_()
         if n_active_keep > 0:
-            dst[:n_active_keep].copy_(
-                self.corpus[keep_start:self.active_len])
+            contiguous = kept == list(range(kept[0], kept[-1] + 1)) \
+                and starts[kept[0]] + n_active_keep <= self.active_len
+            if contiguous:
+                s0 = starts[kept[0]]
+                dst[:n_active_keep].copy_(
+                    self.corpus[s0:s0 + n_active_keep])
+                if self.staging_hit is not None:
+                    self.staging_hit[:n_active_keep].copy_(
+                        self.hit[s0:s0 + n_active_keep])
+            else:
+                # Non-contiguous survivors (LFU): one vectorized
+                # gather via repeat_interleave over kept extents.
+                klens = torch.tensor([lens[i] for i in kept],
+                                     dtype=torch.int64,
+                                     device=self.device)
+                kstarts = torch.tensor([starts[i] for i in kept],
+                                       dtype=torch.int64,
+                                       device=self.device)
+                doc_of = torch.repeat_interleave(
+                    torch.arange(len(kept), device=self.device), klens)
+                excl = torch.cumsum(klens, 0) - klens
+                offs = torch.arange(n_active_keep, device=self.device)
+                idx = kstarts[doc_of] + (offs - excl[doc_of])
+                dst[:n_active_keep] = self.corpus[idx]
+                if self.staging_hit is not None:
+                    self.staging_hit[:n_active_keep] = self.hit[idx]
+            if self.staging_hit is not None:
+                self.staging_hit[:n_active_keep] *= self.lfu_decay
         if snap > 0:
             dst[n_active_keep:n_new].copy_(self.delta[:snap])
+            if self.staging_hit is not None:
+                self.staging_hit[n_active_keep:n_new].copy_(
+                    self.hit_delta[:snap])
 
-        new_doc_lens: deque[int] = deque()
-        acc = 0
-        for ln in self.active_doc_lens:
-            acc += ln
-            if acc > keep_start:
-                new_doc_lens.append(ln)
+        new_doc_lens: deque[int] = deque(lens[i] for i in kept)
+        new_doc_ages: deque[int] = deque(ages[i] + 1 for i in kept)
         acc = 0
         for ln in self.delta_doc_lens:
             acc += ln
             if acc <= snap:
                 new_doc_lens.append(ln)
+                new_doc_ages.append(0)
 
         # Staging owns a copy of the snapshot; compact it out of the
         # delta right away so appends always see the full capacity.
@@ -194,9 +314,15 @@ class GlobalIndex:
         remaining = self.delta_len - snap
         if remaining > 0:
             self.delta[:remaining] = self.delta[snap:self.delta_len].clone()
+            if self.hit_delta is not None:
+                self.hit_delta[:remaining] = \
+                    self.hit_delta[snap:self.delta_len].clone()
+        if self.hit_delta is not None:
+            self.hit_delta[max(remaining, 0):].zero_()
         self.delta_len = remaining
         self.delta_len_t.fill_(remaining)
         self.delta_doc_lens = self.delta_doc_lens[docs_absorbed:]
+        self.position_epoch += 1
 
         # Build over the real prefix plus one sentinel column so the
         # build-time suffix order matches query-time comparisons.
@@ -208,11 +334,11 @@ class GlobalIndex:
                 self._build_staging_sa(dst, m)
             event = torch.cuda.Event()
             event.record(self.rebuild_stream)
-            self._pending = (n_new, new_doc_lens)
+            self._pending = (n_new, new_doc_lens, new_doc_ages)
             self._rebuild_event = event
         else:
             self._build_staging_sa(dst, m)
-            self._finish_swap(n_new, new_doc_lens)
+            self._finish_swap(n_new, new_doc_lens, new_doc_ages)
 
     def _build_staging_sa(self, dst: torch.Tensor, m: int) -> None:
         self.staging_sa[:m] = build_suffix_array(dst[:m]).to(torch.int32)
@@ -232,14 +358,19 @@ class GlobalIndex:
             count += 1
         return count
 
-    def _finish_swap(self, n_new: int, new_doc_lens: deque[int]) -> None:
+    def _finish_swap(self, n_new: int, new_doc_lens: deque[int],
+                     new_doc_ages: deque[int]) -> None:
         # In-place copy instead of a reference swap: captured CUDA
         # graphs (and compiled propose paths) bind the active tensors'
         # storage, so the active buffers must keep their identity.
         self.corpus.copy_(self.staging_corpus)
         self.sa.copy_(self.staging_sa)
+        if self.hit is not None:
+            self.hit.copy_(self.staging_hit)
         self.active_len = n_new
         self.active_doc_lens = new_doc_lens
+        self.active_doc_ages = new_doc_ages
+        self.position_epoch += 1
         self._rebuild_event = None
         self._pending = None
 
@@ -248,8 +379,33 @@ class GlobalIndex:
         if self._rebuild_event is None:
             return
         if self._rebuild_event.query():
-            n_new, new_doc_lens = self._pending
-            self._finish_swap(n_new, new_doc_lens)
+            n_new, new_doc_lens, new_doc_ages = self._pending
+            self._finish_swap(n_new, new_doc_lens, new_doc_ages)
+
+    def credit_accepted(self, occ_pos: torch.Tensor,
+                        weights: torch.Tensor,
+                        tier: torch.Tensor) -> None:
+        """Scatter accepted-token credit onto occurrence positions.
+
+        Pure tensor ops (graph-safe). Rows with tier 0 contribute
+        nothing; tier 1 credits corpus coordinates, tier 2 delta
+        coordinates.
+
+        Args:
+            occ_pos: [B, R] i64 positions (tier coordinates).
+            weights: [B, R] f32 credit per position (0 disables).
+            tier: [B] i8 source tier per row.
+        """
+        if self.hit is None:
+            return
+        w_sa = weights * (tier == 1).unsqueeze(1).to(weights.dtype)
+        self.hit.scatter_add_(
+            0, occ_pos.clamp(0, self.capacity - 1).reshape(-1),
+            w_sa.reshape(-1))
+        w_d = weights * (tier == 2).unsqueeze(1).to(weights.dtype)
+        self.hit_delta.scatter_add_(
+            0, occ_pos.clamp(0, self.delta_capacity - 1).reshape(-1),
+            w_d.reshape(-1))
 
     # ------------------------------------------------------------------
     # queries
@@ -279,7 +435,7 @@ class GlobalIndex:
         """
         caps = torch.full((1,), max_len, dtype=torch.int64,
                           device=self.device)
-        match_len, cont, occ_count = self._query_backoff(
+        match_len, cont, occ_count, _, _ = self._query_backoff(
             query, query_len, max_len, caps)
         return match_len[:, 0], cont[:, 0], occ_count[:, 0]
 
@@ -304,9 +460,11 @@ class GlobalIndex:
 
         Returns:
             (match_len [B, C] i64, cont [B, C, R, k] int32 padded with
-             -1, occ_count [B, C] i64). Per cap, occurrences come from
-            either the SA or the delta, whichever matched longer (ties
-            prefer the SA).
+             -1, occ_count [B, C] i64, occ_pos [B, C, R] i64
+             occurrence start positions in the winning tier's
+             coordinates, tier [B, C] i8: 0 none, 1 SA/corpus,
+             2 delta). Per cap, occurrences come from either the SA or
+            the delta, whichever matched longer (ties prefer the SA).
         """
         b = query.shape[0]
         cnum = caps.shape[0]
@@ -367,7 +525,16 @@ class GlobalIndex:
         cont = torch.where(sel_delta, d_cont, cont)
         occ_count = torch.where(use_sa, sa_cnt,
                                 torch.where(use_delta, d_cnt, zero))
-        return match_len, cont.reshape(b, cnum, r, self.k), occ_count
+        # Occurrence start positions in the winning tier's coordinate
+        # system (for accepted-credit attribution). SA positions are
+        # pattern starts in the corpus; delta positions already are.
+        tier = (use_sa.to(torch.int8) + 2 * use_delta.to(torch.int8))
+        occ_pos = torch.where(
+            use_sa.unsqueeze(2), sa_occ.to(torch.int64),
+            torch.where(use_delta.unsqueeze(2), d_pos.to(torch.int64),
+                        torch.zeros_like(d_pos, dtype=torch.int64)))
+        return (match_len, cont.reshape(b, cnum, r, self.k), occ_count,
+                occ_pos, tier)
 
     def draft(
         self,
@@ -410,7 +577,7 @@ class GlobalIndex:
                 dtype=torch.int64, device=device)
         cnum = caps.shape[0]
 
-        match_len, cont, occ_count = self._query_backoff(
+        match_len, cont, occ_count, _, _ = self._query_backoff(
             query, query_len, max_len, caps)
         flat_len = match_len.reshape(b * cnum)
         if max_spec_factor is None:

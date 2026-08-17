@@ -9,7 +9,7 @@ P = 8
 
 
 LEGACY = dict(vote_smoothing_alpha=0.0, local_mode="backoff",
-              merge_paths=False, dynamic_k=False)
+              merge_paths=False, dynamic_k=False, eviction="fifo")
 
 
 def _drafter(device, enable_global=False, **kw):

@@ -55,6 +55,9 @@ class SuffixGPUDrafter:
         dyn_k_scale: float = 1.5,
         dyn_k_offset: float = 1.0,
         dyn_k_min: int = 2,
+        eviction: str = "lfu",
+        lfu_decay: float = 0.5,
+        lfu_protect_rebuilds: int = 1,
     ):
         self.k = k
         self.device = torch.device(device)
@@ -86,6 +89,15 @@ class SuffixGPUDrafter:
         self.dyn_k_offset = float(dyn_k_offset)
         self.dyn_k_min = int(dyn_k_min)
         self._accept_ema: torch.Tensor | None = None
+        # LFU credit attribution: winning global occurrences of the
+        # previous step, credited with this step's accept count in
+        # update_state. Invalidated (tier=0) via poll() whenever the
+        # index's position epoch moves.
+        self.eviction = eviction
+        self._last_pos: torch.Tensor | None = None
+        self._last_w: torch.Tensor | None = None
+        self._last_tier: torch.Tensor | None = None
+        self._last_epoch = -1
         # Local candidates: support thresholds 2^0 .. 2^(C-1) (arctic's
         # length/support Pareto frontier gets denser as C grows).
         support_thresholds = tuple(
@@ -125,6 +137,9 @@ class SuffixGPUDrafter:
                 rebuild_threshold=rebuild_threshold,
                 device=self.device,
                 rebuild_stream=rebuild_stream,
+                eviction=eviction,
+                lfu_decay=lfu_decay,
+                lfu_protect_rebuilds=lfu_protect_rebuilds,
             )
 
     def _gather_tails(
@@ -148,9 +163,30 @@ class SuffixGPUDrafter:
         """Host-side: swap in a finished background rebuild, if any.
 
         Call once per step outside the (compile-safe) propose path.
+        Also drops cached credit positions whenever stored coordinates
+        moved (delta compaction / active swap), so stale positions are
+        never credited.
         """
         if self.global_index is not None:
             self.global_index.poll_rebuild()
+            if (self._last_tier is not None
+                    and self.global_index.position_epoch
+                    != self._last_epoch):
+                self._last_tier.zero_()
+                self._last_epoch = self.global_index.position_epoch
+
+    def _ensure_credit(self, b: int, r: int) -> None:
+        if self._last_pos is not None and self._last_pos.shape[0] >= b:
+            return
+        pos = torch.zeros(b, r, dtype=torch.int64, device=self.device)
+        w = torch.zeros(b, r, dtype=torch.float32, device=self.device)
+        tier = torch.zeros(b, dtype=torch.int8, device=self.device)
+        if self._last_pos is not None:
+            n0 = self._last_pos.shape[0]
+            pos[:n0] = self._last_pos
+            w[:n0] = self._last_w
+            tier[:n0] = self._last_tier
+        self._last_pos, self._last_w, self._last_tier = pos, w, tier
 
     # ------------------------------------------------------------------
     # dynamic-k accept EMA
@@ -166,14 +202,15 @@ class SuffixGPUDrafter:
 
     def reset_rows(self, row_indices: torch.Tensor | list[int]) -> None:
         """Clear per-row drafter state when batch rows are recycled."""
-        if self._accept_ema is None:
-            return
         if not torch.is_tensor(row_indices):
             if not row_indices:
                 return
             row_indices = torch.tensor(row_indices, dtype=torch.int64,
                                        device=self.device)
-        self._accept_ema[row_indices] = 0.0
+        if self._accept_ema is not None:
+            self._accept_ema[row_indices] = 0.0
+        if self._last_tier is not None:
+            self._last_tier[row_indices] = 0
 
     def _dyn_cap(self, b: int) -> torch.Tensor | None:
         """Per-row emission limit from the accept EMA, or None."""
@@ -224,6 +261,15 @@ class SuffixGPUDrafter:
             upd = (self.ema_decay * ema[:b]
                    + (1.0 - self.ema_decay) * acc)
             ema[:b] = torch.where(cnt > 0, upd, ema[:b])
+        if (self.global_index is not None
+                and self.global_index.hit is not None
+                and self._last_tier is not None
+                and self._last_tier.shape[0] >= b):
+            credit = (cnt - 1).clamp(min=0).to(torch.float32)
+            self.global_index.credit_accepted(
+                self._last_pos[:b],
+                self._last_w[:b] * credit.unsqueeze(1),
+                self._last_tier[:b])
         if triton_kernels.available(token_ids_gpu, sampled_token_ids):
             triton_kernels.scatter_append(
                 token_ids_gpu, base, cnt, sampled_token_ids)
@@ -309,9 +355,10 @@ class SuffixGPUDrafter:
                 num_tokens_no_spec, token_ids_gpu, combined_mask)
             tails, tail_len = self._gather_tails(num_tokens_no_spec,
                                                  token_ids_gpu)
-            g_len, g_cont, g_occ = self.global_index._query_backoff(
-                tails.to(torch.int32), tail_len, self.max_pattern_len,
-                self._global_caps)
+            g_len, g_cont, g_occ, g_pos, g_tier = \
+                self.global_index._query_backoff(
+                    tails.to(torch.int32), tail_len,
+                    self.max_pattern_len, self._global_caps)
 
             cl = cand_l.shape[1]
             cg = g_len.shape[1]
@@ -358,6 +405,7 @@ class SuffixGPUDrafter:
             num_valid = torch.where(pick_global, g_emit,
                                     l_emit.to(torch.int64))
 
+            pick_joint = torch.zeros_like(pick_global)
             if self.merge_paths:
                 # Joint candidate: union of the longest local and
                 # longest global occurrence sets when both matched the
@@ -391,6 +439,28 @@ class SuffixGPUDrafter:
                 draft = torch.where(pick_joint.unsqueeze(1), j_chain,
                                     draft)
                 num_valid = torch.where(pick_joint, j_emit, num_valid)
+
+            if self.global_index.hit is not None:
+                # Record the winning global occurrences; update_state
+                # credits them with the next step's accept count.
+                self._ensure_credit(b, r)
+                sel_pos = torch.where(
+                    pick_joint.unsqueeze(1), g_pos[:, 0],
+                    g_pos[bidx, best_g])
+                sel_occ = torch.where(pick_joint, g_occ[:, 0],
+                                      g_occ[bidx, best_g])
+                sel_tier = torch.where(pick_joint, g_tier[:, 0],
+                                       g_tier[bidx, best_g])
+                used = pick_global | pick_joint
+                sel_tier = torch.where(used, sel_tier,
+                                       torch.zeros_like(sel_tier))
+                rowa = (torch.arange(r, device=self.device).view(1, r)
+                        < sel_occ.unsqueeze(1))
+                w = rowa.to(torch.float32) / sel_occ.clamp(
+                    min=1).to(torch.float32).unsqueeze(1)
+                self._last_pos[:b].copy_(sel_pos)
+                self._last_w[:b].copy_(w)
+                self._last_tier[:b].copy_(sel_tier)
 
         num_valid = torch.where(
             combined_mask, num_valid.to(torch.int64),
