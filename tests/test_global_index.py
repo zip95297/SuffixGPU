@@ -146,7 +146,7 @@ def test_proposer_global_harvest(device):
         k=K, device=device, max_pattern_len=P, max_occurrences=R,
         enable_global=True, global_capacity=1024, delta_capacity=256,
         rebuild_threshold=1, vote_smoothing_alpha=0.0,
-        local_mode="backoff")
+        local_mode="backoff", merge_paths=False)
     # Request 0 finished with a distinctive repeating response.
     buf = torch.zeros(2, 32, dtype=torch.int32, device=device)
     done = [9, 8, 7, 6, 5, 9, 8, 7, 6, 4]

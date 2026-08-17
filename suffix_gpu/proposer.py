@@ -49,6 +49,7 @@ class SuffixGPUDrafter:
         vote_smoothing_alpha: float = 1.0,
         local_mode: str = "soft",
         soft_lambda: float = 0.5,
+        merge_paths: bool = True,
     ):
         self.k = k
         self.device = torch.device(device)
@@ -66,6 +67,11 @@ class SuffixGPUDrafter:
         # instead of the C-candidate hard backoff ladder.
         self.local_mode = local_mode
         self.soft_lambda = float(soft_lambda)
+        # merge_paths: when the longest local and global matches have
+        # equal length, additionally vote over the union of both
+        # occurrence sets; the joint draft wins only on a strictly
+        # greater score than either path alone.
+        self.merge_paths = bool(merge_paths)
         # Local candidates: support thresholds 2^0 .. 2^(C-1) (arctic's
         # length/support Pareto frontier gets denser as C grows).
         support_thresholds = tuple(
@@ -293,6 +299,38 @@ class SuffixGPUDrafter:
                                 l_chain)
             num_valid = torch.where(pick_global, g_emit,
                                     l_emit.to(torch.int64))
+
+            if self.merge_paths:
+                # Joint candidate: union of the longest local and
+                # longest global occurrence sets when both matched the
+                # same length. Rows are gated by weight 0 (and -1
+                # continuations) elsewhere, so shapes stay static.
+                l_len0 = cand_l[:, 0]
+                g_len0 = g_len[:, 0]
+                joint_ok = (l_len0 > 0) & (l_len0 == g_len0) \
+                    & combined_mask
+                j_cont = torch.cat([cont_l[:, 0], g_cont[:, 0]], dim=1)
+                if w_l is None:
+                    w_loc = torch.ones(b, r, dtype=torch.float32,
+                                       device=self.device)
+                else:
+                    w_loc = w_l.reshape(b, cl, r)[:, 0]
+                j_w = torch.cat(
+                    [w_loc, torch.ones(b, r, dtype=torch.float32,
+                                       device=self.device)], dim=1)
+                j_w = j_w * joint_ok.unsqueeze(1).to(torch.float32)
+                j_occ = torch.full((b,), 2 * r, dtype=torch.int64,
+                                   device=self.device)
+                j_cap = self.local_kernel._spec_cap(l_len0)
+                j_chain, _, j_emit, j_score = expand_chain(
+                    j_cont, j_occ, k,
+                    min_token_prob=self.min_token_prob, cap=j_cap,
+                    weights=j_w, alpha=self.vote_smoothing_alpha)
+                pick_joint = ((j_score > l_score) & (j_score > g_score)
+                              & joint_ok)
+                draft = torch.where(pick_joint.unsqueeze(1), j_chain,
+                                    draft)
+                num_valid = torch.where(pick_joint, j_emit, num_valid)
 
         num_valid = torch.where(
             combined_mask, num_valid.to(torch.int64),
