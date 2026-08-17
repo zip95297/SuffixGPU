@@ -277,9 +277,15 @@ class SuffixGPUDrafter:
         if self.dynamic_k:
             ema = self._ensure_ema(b)
             acc = (cnt - 1).clamp(min=0).to(torch.float32)
-            upd = (self.ema_decay * ema[:b]
-                   + (1.0 - self.ema_decay) * acc)
-            ema[:b] = torch.where(cnt > 0, upd, ema[:b])
+            # Asymmetric: jump up instantly, decay smoothly down. A
+            # proportional cap otherwise feeds back on itself (accepted
+            # <= cap caps the EMA caps the cap) and short chains lock
+            # the row at the minimum for the whole request.
+            down = (self.ema_decay * ema[:b]
+                    + (1.0 - self.ema_decay) * acc)
+            ema[:b] = torch.where(
+                (cnt > 0) & (acc >= ema[:b]), acc,
+                torch.where(cnt > 0, down, ema[:b]))
         if (self.global_index is not None
                 and self.global_index.hit is not None
                 and self._last_tier is not None
