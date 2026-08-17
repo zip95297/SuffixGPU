@@ -24,12 +24,16 @@ K = 4
 P = 8
 R = 16
 
+# Pin pre-v2 drafter semantics so the arctic-equivalence oracles stay
+# valid: no vote smoothing.
+LEGACY = dict(vote_smoothing_alpha=0.0)
+
 
 def _make_drafter(device, enable_global: bool = True) -> SuffixGPUDrafter:
     return SuffixGPUDrafter(
         k=K, device=device, max_pattern_len=P, max_occurrences=R,
         enable_global=enable_global, global_capacity=1 << 16,
-        delta_capacity=1 << 12, rebuild_threshold=1 << 10)
+        delta_capacity=1 << 12, rebuild_threshold=1 << 10, **LEGACY)
 
 
 def _adapter_propose(drafter: SuffixGPUDrafter, buf: torch.Tensor,
@@ -293,14 +297,15 @@ def test_adaptive_max_spec_factor(device):
     nts = torch.tensor([len(seq)], dtype=torch.int32, device=device)
 
     base = SuffixGPUDrafter(k=K, device=device, max_pattern_len=P,
-                            max_occurrences=R, enable_global=False)
+                            max_occurrences=R, enable_global=False,
+                            **LEGACY)
     draft, nv = base.propose(nts, buf)
     assert nv[0].item() == 4
     assert draft[0].tolist() == [7, 8, 9, 1]
 
     clamped = SuffixGPUDrafter(k=K, device=device, max_pattern_len=P,
                                max_occurrences=R, enable_global=False,
-                               max_spec_factor=1.0)
+                               max_spec_factor=1.0, **LEGACY)
     draft, nv = clamped.propose(nts, buf)
     assert nv[0].item() == 2  # 1.0 * match_len(2) + 0
     assert draft[0].tolist() == [7, 8, -1, -1]
@@ -318,14 +323,14 @@ def test_adaptive_min_token_prob(device):
 
     mid = SuffixGPUDrafter(k=K, device=device, max_pattern_len=P,
                            max_occurrences=R, enable_global=False,
-                           min_token_prob=0.5)
+                           min_token_prob=0.5, **LEGACY)
     draft, nv = mid.propose(nts, buf)
     assert nv[0].item() == 1  # depth 0 passes (2/3), depth 1 cut (1/3)
     assert draft[0].tolist() == [6, -1, -1, -1]
 
     strict = SuffixGPUDrafter(k=K, device=device, max_pattern_len=P,
                               max_occurrences=R, enable_global=False,
-                              min_token_prob=0.7)
+                              min_token_prob=0.7, **LEGACY)
     draft, nv = strict.propose(nts, buf)
     assert nv[0].item() == 0  # 2/3 < 0.7: nothing drafted
     assert draft[0].tolist() == [-1, -1, -1, -1]
