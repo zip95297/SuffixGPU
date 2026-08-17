@@ -54,7 +54,8 @@ class LocalMatchKernel(nn.Module):
                  min_token_prob: float = 0.0,
                  max_spec_factor: float | None = None,
                  max_spec_offset: float = 0.0,
-                 support_thresholds: Sequence[int] = (1, 2, 4, 8)):
+                 support_thresholds: Sequence[int] = (1, 2, 4, 8),
+                 vote_smoothing_alpha: float = 0.0):
         super().__init__()
         self.k = k
         self.max_pattern_len = max_pattern_len
@@ -63,6 +64,7 @@ class LocalMatchKernel(nn.Module):
         self.min_token_prob = min_token_prob
         self.max_spec_factor = max_spec_factor
         self.max_spec_offset = max_spec_offset
+        self.vote_smoothing_alpha = vote_smoothing_alpha
         self.support_thresholds = tuple(int(t) for t in support_thresholds)
         if not self.support_thresholds:
             raise ValueError("support_thresholds must be non-empty")
@@ -78,23 +80,18 @@ class LocalMatchKernel(nn.Module):
                + self.max_spec_offset).floor().to(torch.int64)
         return cap.clamp(min=0)
 
-    def forward(
+    def gather_candidates(
         self,
         num_tokens_no_spec: torch.Tensor,
         token_ids: torch.Tensor,
         combined_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-               torch.Tensor]:
-        """Match and draft on per-request token buffers.
-
-        Args:
-            num_tokens_no_spec: [B] int32 token counts.
-            token_ids: [B, S] int32 token buffer.
-            combined_mask: [B] bool rows allowed to draft.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Backoff candidate lengths with continuation blocks.
 
         Returns:
-            (draft_tokens [B, k] int32, num_valid [B] int32,
-             match_len [B] i64, occ_count [B] i64, score [B] f32)
+            (cand [B, C] i64 candidate match lengths,
+             cont [B, C, R, K] int32 continuations (-1 padded),
+             occ_count [B, C] i64 occurrence counts).
         """
         b, s = token_ids.shape
         k = self.k
@@ -151,6 +148,13 @@ class LocalMatchKernel(nn.Module):
         cand = torch.where(
             (cand >= self.min_match_len) & combined_mask.unsqueeze(1),
             cand, torch.zeros_like(cand))
+        # Adjacent duplicates draft identical chains (same length =>
+        # same occurrence set); zeroing them skips their occurrence
+        # scans while argmax still picks the surviving first copy.
+        if cand.shape[1] > 1:
+            dup = torch.zeros_like(cand, dtype=torch.bool)
+            dup[:, 1:] = cand[:, 1:] == cand[:, :-1]
+            cand = torch.where(dup, torch.zeros_like(cand), cand)
         c = cand.shape[1]
 
         # Earliest occurrence end positions for all candidates: one
@@ -188,32 +192,72 @@ class LocalMatchKernel(nn.Module):
         vals = token_ids.gather(
             1, idx.clamp(0, s - 1).reshape(b, c * r * k)).reshape(
                 b, c, r, k)
-        cont_all = torch.where(valid_idx, vals, -1).reshape(b * c, r, k)
+        cont = torch.where(valid_idx, vals, -1)
+        return cand, cont, occ_count
+
+    def forward(
+        self,
+        num_tokens_no_spec: torch.Tensor,
+        token_ids: torch.Tensor,
+        combined_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor]:
+        """Match and draft on per-request token buffers.
+
+        Args:
+            num_tokens_no_spec: [B] int32 token counts.
+            token_ids: [B, S] int32 token buffer.
+            combined_mask: [B] bool rows allowed to draft.
+
+        Returns:
+            (draft_tokens [B, k] int32, num_valid [B] int32,
+             match_len [B] i64, occ_count [B] i64, score [B] f32)
+        """
+        b, _ = token_ids.shape
+        k = self.k
+        r = self.max_occurrences
+        device = token_ids.device
+        cand, cont, occ_count = self.gather_candidates(
+            num_tokens_no_spec, token_ids, combined_mask)
+        c = cand.shape[1]
+        cont_all = cont.reshape(b * c, r, k)
         occ_all = occ_count.reshape(b * c)
 
         cap = self._spec_cap(cand.reshape(b * c))
         chain, _, num_emit, score = expand_chain(
             cont_all, occ_all, k, min_token_prob=self.min_token_prob,
-            cap=cap)
+            cap=cap, alpha=self.vote_smoothing_alpha)
 
         score = score.reshape(b, c)
         num_emit = num_emit.reshape(b, c)
         chain = chain.reshape(b, c, k)
         occ_all = occ_all.reshape(b, c)
-        # Prefer longer matches on exact score ties (arctic iterates
-        # lengths ascending with a >= comparison, so longer wins).
-        tie = cand.to(torch.float32) * 1e-6
-        best = (score + tie).argmax(dim=1)
-
-        bidx = torch.arange(b, device=device)
-        sel_chain = chain[bidx, best]
-        sel_emit = num_emit[bidx, best]
-        sel_len = cand[bidx, best]
-        sel_occ = occ_all[bidx, best]
-        sel_score = score[bidx, best]
+        sel_chain, sel_emit, sel_len, sel_occ, sel_score = \
+            select_local_best(cand, chain, num_emit, occ_all, score)
 
         slot_k = torch.arange(k, device=device).unsqueeze(0)
         sel_chain = torch.where(slot_k < sel_emit.unsqueeze(1), sel_chain,
                                 -1)
         return (sel_chain.to(torch.int32), sel_emit.to(torch.int32),
                 sel_len, sel_occ, sel_score)
+
+
+def select_local_best(
+    cand: torch.Tensor,
+    chain: torch.Tensor,
+    num_emit: torch.Tensor,
+    occ: torch.Tensor,
+    score: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+           torch.Tensor]:
+    """Pick the best-scored local candidate per request.
+
+    Prefer longer matches on exact score ties (arctic iterates lengths
+    ascending with a >= comparison, so longer wins).
+    """
+    b = cand.shape[0]
+    tie = cand.to(torch.float32) * 1e-6
+    best = (score + tie).argmax(dim=1)
+    bidx = torch.arange(b, device=cand.device)
+    return (chain[bidx, best], num_emit[bidx, best], cand[bidx, best],
+            occ[bidx, best], score[bidx, best])

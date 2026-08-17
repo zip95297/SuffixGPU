@@ -18,8 +18,9 @@ from __future__ import annotations
 import torch
 
 from suffix_gpu import triton_kernels
+from suffix_gpu.expand import expand_chain
 from suffix_gpu.global_index import GlobalIndex
-from suffix_gpu.local_matcher import LocalMatchKernel
+from suffix_gpu.local_matcher import LocalMatchKernel, select_local_best
 
 
 class SuffixGPUDrafter:
@@ -45,6 +46,8 @@ class SuffixGPUDrafter:
         max_spec_offset: float = 0.0,
         min_token_prob: float = 0.0,
         num_backoff: int = 8,
+        vote_smoothing_alpha: float = 0.0,
+        parallel_paths: bool = True,
     ):
         self.k = k
         self.device = torch.device(device)
@@ -53,6 +56,18 @@ class SuffixGPUDrafter:
         self.max_spec_offset = max_spec_offset
         self.min_token_prob = min_token_prob
         self.num_backoff = max(1, int(num_backoff))
+        # Laplace smoothing of the vote fractions: p = v / (a + alpha).
+        # Opt-in (default 0.0 = legacy scoring, output-identical);
+        # alpha > 0 makes single-occurrence "unanimous" chains decay
+        # instead of riding a fake probability of 1.0.
+        self.vote_smoothing_alpha = float(vote_smoothing_alpha)
+        # parallel_paths: run the global match phase (SA walk + delta
+        # scan) on a side stream concurrently with the local match
+        # phase; fork/join via events, capturable into CUDA graphs.
+        self.parallel_paths = bool(parallel_paths)
+        self._ps_stream: torch.cuda.Stream | None = None
+        self._ps_fork: torch.cuda.Event | None = None
+        self._ps_join: torch.cuda.Event | None = None
         # Local candidates: support thresholds 2^0 .. 2^(C-1) (arctic's
         # length/support Pareto frontier gets denser as C grows).
         support_thresholds = tuple(
@@ -77,6 +92,7 @@ class SuffixGPUDrafter:
             max_spec_factor=max_spec_factor,
             max_spec_offset=max_spec_offset,
             support_thresholds=support_thresholds,
+            vote_smoothing_alpha=self.vote_smoothing_alpha,
         ).to(self.device)
         self.global_index: GlobalIndex | None = None
         self._ingested: dict = {}
@@ -205,6 +221,11 @@ class SuffixGPUDrafter:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Draft tokens from local history and the global index.
 
+        Local and global candidate blocks share one fused expand+score
+        launch; selection keeps the hierarchical rules (within-local
+        ties prefer the longer match, within-global the longer cap,
+        global beats local only on a strictly greater score).
+
         Args:
             num_tokens_no_spec: [B] int32 token counts.
             token_ids_gpu: [B, S] int32 token buffer.
@@ -214,30 +235,89 @@ class SuffixGPUDrafter:
             (draft_tokens [B, k] int32, num_valid_draft_tokens [B] int32)
         """
         b = num_tokens_no_spec.shape[0]
+        k = self.k
         if combined_mask is None:
             combined_mask = torch.ones(
                 b, dtype=torch.bool, device=self.device)
-        (local_draft, local_nv, local_len, local_occ,
-         local_score) = self.local_kernel(
-            num_tokens_no_spec, token_ids_gpu, combined_mask)
 
         if self.global_index is None:
-            draft, num_valid = local_draft, local_nv
+            (draft, num_valid, _, _, _) = self.local_kernel(
+                num_tokens_no_spec, token_ids_gpu, combined_mask)
         else:
+            r = self.local_kernel.max_occurrences
             tails, tail_len = self._gather_tails(num_tokens_no_spec,
                                                  token_ids_gpu)
-            g_chain, g_nv, g_len, g_occ, g_score = self.global_index.draft(
-                tails.to(torch.int32), tail_len, self.max_pattern_len,
-                self.k, min_token_prob=self.min_token_prob,
-                max_spec_factor=self.max_spec_factor,
-                max_spec_offset=self.max_spec_offset,
-                caps=self._global_caps)
+            use_ps = (self.parallel_paths
+                      and self.device.type == "cuda")
+            if use_ps:
+                if self._ps_stream is None:
+                    self._ps_stream = torch.cuda.Stream(self.device)
+                    self._ps_fork = torch.cuda.Event()
+                    self._ps_join = torch.cuda.Event()
+                cur = torch.cuda.current_stream(self.device)
+                self._ps_fork.record(cur)
+                capturing = torch.cuda.is_current_stream_capturing()
+                with torch.cuda.stream(self._ps_stream):
+                    self._ps_stream.wait_event(self._ps_fork)
+                    if not capturing:
+                        # Allocator hint: tails is main-stream memory
+                        # read on the side stream.
+                        tails.record_stream(self._ps_stream)
+                        tail_len.record_stream(self._ps_stream)
+                    g_len, g_cont, g_occ = \
+                        self.global_index._query_backoff(
+                            tails.to(torch.int32), tail_len,
+                            self.max_pattern_len, self._global_caps)
+                    self._ps_join.record(self._ps_stream)
+                # Local match runs concurrently on the main stream.
+                cand_l, cont_l, occ_l = \
+                    self.local_kernel.gather_candidates(
+                        num_tokens_no_spec, token_ids_gpu,
+                        combined_mask)
+                cur.wait_event(self._ps_join)
+                if not capturing:
+                    for t in (g_len, g_cont, g_occ):
+                        t.record_stream(cur)
+            else:
+                cand_l, cont_l, occ_l = \
+                    self.local_kernel.gather_candidates(
+                        num_tokens_no_spec, token_ids_gpu,
+                        combined_mask)
+                g_len, g_cont, g_occ = self.global_index._query_backoff(
+                    tails.to(torch.int32), tail_len,
+                    self.max_pattern_len, self._global_caps)
 
-            pick_global = (g_score > local_score) & combined_mask
-            draft = torch.where(pick_global.unsqueeze(1),
-                                g_chain.to(torch.int32), local_draft)
-            num_valid = torch.where(pick_global, g_nv.to(torch.int64),
-                                    local_nv.to(torch.int64))
+            cl = cand_l.shape[1]
+            cg = g_len.shape[1]
+            len_all = torch.cat([cand_l, g_len], dim=1)
+            cont_all = torch.cat([cont_l, g_cont], dim=1)
+            occ_all = torch.cat([occ_l, g_occ], dim=1)
+            cap_all = self.local_kernel._spec_cap(len_all.reshape(-1))
+            chain, _, emit, score = expand_chain(
+                cont_all.reshape(b * (cl + cg), r, k),
+                occ_all.reshape(-1), k,
+                min_token_prob=self.min_token_prob, cap=cap_all,
+                alpha=self.vote_smoothing_alpha)
+            chain = chain.view(b, cl + cg, k)
+            emit = emit.view(b, cl + cg)
+            score = score.view(b, cl + cg)
+
+            (l_chain, l_emit, _, _, l_score) = select_local_best(
+                cand_l, chain[:, :cl], emit[:, :cl], occ_all[:, :cl],
+                score[:, :cl])
+            # Global: first max = longest cap (caps are descending).
+            g_score_all = score[:, cl:]
+            best_g = g_score_all.argmax(dim=1)
+            bidx = torch.arange(b, device=self.device)
+            g_chain = chain[:, cl:][bidx, best_g]
+            g_emit = emit[:, cl:][bidx, best_g]
+            g_score = g_score_all[bidx, best_g]
+
+            pick_global = (g_score > l_score) & combined_mask
+            draft = torch.where(pick_global.unsqueeze(1), g_chain,
+                                l_chain)
+            num_valid = torch.where(pick_global, g_emit,
+                                    l_emit.to(torch.int64))
 
         num_valid = torch.where(
             combined_mask, num_valid.to(torch.int64),
