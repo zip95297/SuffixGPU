@@ -34,26 +34,24 @@ def test_dynamic_k_cap_follows_accept_ema(device):
     pattern = ([1, 2, 3, 4] * 5)[:20]
     buf[0, :20] = torch.tensor(pattern, dtype=torch.int32)
 
-    # Step 1: 4 valid sampled ids => accepted 3 => EMA jumps to 3
-    # (asymmetric: up is instant) => cap ceil(1.5*3) = 5, capped by
-    # chain validity at 3.
+    # Step 1: update_state jumps the EMA to 3 (>= release) before
+    # drafting, so the row is uncapped and drafts the full chain.
     nv, nts = _step(d, buf, 20, 4)
     assert nts == 24
-    assert nv == 3
+    assert nv > 3
 
-    # Step 2: EMA stays 3 => cap 3.
     nv, nts = _step(d, buf, nts, 4)
     assert nts == 28
-    assert nv == 3
+    assert nv > 3
 
-    # Row recycled: EMA reset => standalone propose sees cap dyn_k_min.
+    # Row recycled: EMA reset => standalone propose is re-capped.
     d.reset_rows([0])
     lens = torch.tensor([nts], dtype=torch.int32, device=device)
     _, nv_t = d.propose(lens, buf)
     assert nv_t[0].item() == 1
-    # The next update_state relearns instantly (EMA jumps to 3).
+    # Next update_state relearns instantly (EMA jumps, released).
     nv, nts = _step(d, buf, nts, 4)
-    assert nv == 3
+    assert nv > 3
 
 
 def test_dynamic_k_uncapped_before_history(device):
