@@ -26,7 +26,7 @@ R = 16
 
 # Pin pre-v2 drafter semantics so the arctic-equivalence oracles stay
 # valid: no vote smoothing.
-LEGACY = dict(vote_smoothing_alpha=0.0)
+LEGACY = dict(vote_smoothing_alpha=0.0, local_mode="backoff")
 
 
 def _make_drafter(device, enable_global: bool = True) -> SuffixGPUDrafter:

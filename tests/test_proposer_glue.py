@@ -8,7 +8,7 @@ K = 4
 P = 8
 
 
-LEGACY = dict(vote_smoothing_alpha=0.0)
+LEGACY = dict(vote_smoothing_alpha=0.0, local_mode="backoff")
 
 
 def _drafter(device, enable_global=False, **kw):

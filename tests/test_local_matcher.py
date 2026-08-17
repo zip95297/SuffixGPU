@@ -89,7 +89,8 @@ def test_random_vs_reference(device):
 def test_proposer_contract(device):
     drafter = SuffixGPUDrafter(k=K, device=device, max_pattern_len=MAX_P,
                                max_occurrences=R,
-                               vote_smoothing_alpha=0.0)
+                               vote_smoothing_alpha=0.0,
+                               local_mode="backoff")
     seq = [1, 2, 3, 4, 1, 2, 3, 4, 9, 1, 2, 3, 4]
     buf = torch.tensor([seq], dtype=torch.int32, device=device)
     lens = torch.tensor([len(seq)], dtype=torch.int32, device=device)

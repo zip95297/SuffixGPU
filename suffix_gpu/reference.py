@@ -155,3 +155,70 @@ def naive_local_match(tokens: Sequence[int], k: int, max_pattern_len: int,
     if best_len == 0:
         return [], 0
     return best_chain, best_len
+
+
+def naive_soft_local_match(tokens: Sequence[int], k: int,
+                           max_pattern_len: int,
+                           min_match_len: int = 1,
+                           max_occurrences: int = 32,
+                           min_token_prob: float = 0.0,
+                           max_spec_factor: float | None = None,
+                           max_spec_offset: float = 0.0,
+                           soft_lambda: float = 0.5,
+                           alpha: float = 0.0,
+                           ) -> tuple[list[int], int]:
+    """Reference for the soft weighted-backoff local matcher.
+
+    Every occurrence site (end position i with match length
+    mb[i] >= min_match_len) votes with weight
+    ``soft_lambda ** (L_max - mb[i])``; the R sites kept are the best
+    by (length desc, position asc). Draft by weighted majority vote
+    (ties to smallest token), chain probability
+    p_d = prod(v_w / (a_w + alpha)), emission capped by
+    floor(max_spec_factor * L_max + max_spec_offset).
+
+    Returns:
+        (draft chain, longest match length); empty when no site.
+    """
+    q = len(tokens)
+    sites: list[tuple[int, int]] = []  # (mb, end pos)
+    for i in range(q):
+        best = 0
+        for length in range(1, min(max_pattern_len, i, q - 1) + 1):
+            if i - length < 0:
+                break
+            if list(tokens[i - length:i]) == list(tokens[q - length:]):
+                best = length
+        if best >= max(1, min_match_len):
+            sites.append((best, i))
+    if not sites:
+        return [], 0
+    sites.sort(key=lambda t: (-t[0], t[1]))
+    sites = sites[:max_occurrences]
+    l_max = sites[0][0]
+    occ = [(pos, soft_lambda ** (l_max - mb)) for mb, pos in sites]
+
+    chain: list[int] = []
+    cum = 1.0
+    active = list(occ)
+    for d in range(k):
+        live = [(i, w) for i, w in active if i + d < q]
+        if not live:
+            break
+        votes: dict[int, float] = {}
+        for i, w in live:
+            votes[tokens[i + d]] = votes.get(tokens[i + d], 0.0) + w
+        top = max(votes.items(), key=lambda kv: (kv[1], -kv[0]))[0]
+        a_w = sum(w for _, w in live)
+        cum_next = cum * votes[top] / (a_w + alpha)
+        if min_token_prob > 0 and cum_next < min_token_prob:
+            break
+        cum = cum_next
+        chain.append(top)
+        active = [(i, w) for i, w in live if tokens[i + d] == top]
+    if max_spec_factor is None:
+        cap = k
+    else:
+        cap = max(0, int(max_spec_factor * l_max + max_spec_offset
+                         + 1e-9))
+    return chain[:cap], l_max

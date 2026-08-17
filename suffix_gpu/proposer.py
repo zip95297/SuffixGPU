@@ -47,6 +47,8 @@ class SuffixGPUDrafter:
         min_token_prob: float = 0.0,
         num_backoff: int = 8,
         vote_smoothing_alpha: float = 1.0,
+        local_mode: str = "soft",
+        soft_lambda: float = 0.5,
     ):
         self.k = k
         self.device = torch.device(device)
@@ -59,6 +61,11 @@ class SuffixGPUDrafter:
         # A single-occurrence "unanimous" chain then decays instead of
         # riding a fake probability of 1.0. 0 restores legacy scoring.
         self.vote_smoothing_alpha = float(vote_smoothing_alpha)
+        # local_mode "soft": one weighted ensemble over all match
+        # lengths (occurrences vote with weight lambda^(L_max - L))
+        # instead of the C-candidate hard backoff ladder.
+        self.local_mode = local_mode
+        self.soft_lambda = float(soft_lambda)
         # Local candidates: support thresholds 2^0 .. 2^(C-1) (arctic's
         # length/support Pareto frontier gets denser as C grows).
         support_thresholds = tuple(
@@ -84,6 +91,8 @@ class SuffixGPUDrafter:
             max_spec_offset=max_spec_offset,
             support_thresholds=support_thresholds,
             vote_smoothing_alpha=self.vote_smoothing_alpha,
+            local_mode=self.local_mode,
+            soft_lambda=self.soft_lambda,
         ).to(self.device)
         self.global_index: GlobalIndex | None = None
         self._ingested: dict = {}
@@ -236,7 +245,7 @@ class SuffixGPUDrafter:
                 num_tokens_no_spec, token_ids_gpu, combined_mask)
         else:
             r = self.local_kernel.max_occurrences
-            cand_l, cont_l, occ_l = self.local_kernel.gather_candidates(
+            cand_l, cont_l, occ_l, w_l = self.local_kernel.gather(
                 num_tokens_no_spec, token_ids_gpu, combined_mask)
             tails, tail_len = self._gather_tails(num_tokens_no_spec,
                                                  token_ids_gpu)
@@ -249,12 +258,21 @@ class SuffixGPUDrafter:
             len_all = torch.cat([cand_l, g_len], dim=1)
             cont_all = torch.cat([cont_l, g_cont], dim=1)
             occ_all = torch.cat([occ_l, g_occ], dim=1)
+            if w_l is None:
+                w_all = None
+            else:
+                # Global rows vote with unit mass (fp32-exact counts).
+                w_all = torch.cat(
+                    [w_l.reshape(b, cl, r),
+                     torch.ones(b, cg, r, dtype=torch.float32,
+                                device=self.device)],
+                    dim=1).reshape(b * (cl + cg), r)
             cap_all = self.local_kernel._spec_cap(len_all.reshape(-1))
             chain, _, emit, score = expand_chain(
                 cont_all.reshape(b * (cl + cg), r, k),
                 occ_all.reshape(-1), k,
                 min_token_prob=self.min_token_prob, cap=cap_all,
-                alpha=self.vote_smoothing_alpha)
+                weights=w_all, alpha=self.vote_smoothing_alpha)
             chain = chain.view(b, cl + cg, k)
             emit = emit.view(b, cl + cg)
             score = score.view(b, cl + cg)

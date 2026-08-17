@@ -55,7 +55,9 @@ class LocalMatchKernel(nn.Module):
                  max_spec_factor: float | None = None,
                  max_spec_offset: float = 0.0,
                  support_thresholds: Sequence[int] = (1, 2, 4, 8),
-                 vote_smoothing_alpha: float = 0.0):
+                 vote_smoothing_alpha: float = 0.0,
+                 local_mode: str = "backoff",
+                 soft_lambda: float = 0.5):
         super().__init__()
         self.k = k
         self.max_pattern_len = max_pattern_len
@@ -65,6 +67,10 @@ class LocalMatchKernel(nn.Module):
         self.max_spec_factor = max_spec_factor
         self.max_spec_offset = max_spec_offset
         self.vote_smoothing_alpha = vote_smoothing_alpha
+        if local_mode not in ("backoff", "soft"):
+            raise ValueError(f"unknown local_mode {local_mode!r}")
+        self.local_mode = local_mode
+        self.soft_lambda = float(soft_lambda)
         self.support_thresholds = tuple(int(t) for t in support_thresholds)
         if not self.support_thresholds:
             raise ValueError("support_thresholds must be non-empty")
@@ -80,22 +86,13 @@ class LocalMatchKernel(nn.Module):
                + self.max_spec_offset).floor().to(torch.int64)
         return cap.clamp(min=0)
 
-    def gather_candidates(
+    def _compute_match_back(
         self,
         num_tokens_no_spec: torch.Tensor,
         token_ids: torch.Tensor,
-        combined_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Backoff candidate lengths with continuation blocks.
-
-        Returns:
-            (cand [B, C] i64 candidate match lengths,
-             cont [B, C, R, K] int32 continuations (-1 padded),
-             occ_count [B, C] i64 occurrence counts).
-        """
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Shared match-back scan: (mb, q_len, valid_i, pos)."""
         b, s = token_ids.shape
-        k = self.k
-        r = self.max_occurrences
         p = self.max_pattern_len
         device = token_ids.device
         q_len = num_tokens_no_spec.to(torch.int64)
@@ -130,6 +127,105 @@ class LocalMatchKernel(nn.Module):
         # committed continuation token.
         valid_i = pos.unsqueeze(0) < q_len.unsqueeze(1).to(torch.int32)
         mb = torch.where(valid_i, mb, torch.zeros_like(mb))
+        return mb, q_len, valid_i, pos
+
+    def _gather_cont_at(self, token_ids: torch.Tensor,
+                        q_len: torch.Tensor,
+                        occ_end: torch.Tensor,
+                        row_active: torch.Tensor) -> torch.Tensor:
+        """Gather k continuation tokens after flat occurrence ends.
+
+        occ_end/row_active: [B, N]; returns [B, N, K] int32, -1 padded.
+        """
+        b, s = token_ids.shape
+        k = self.k
+        n = occ_end.shape[1]
+        offs_k = torch.arange(k, dtype=torch.int64, device=occ_end.device)
+        idx = occ_end.unsqueeze(2) + offs_k  # [B, N, K]
+        valid_idx = (idx < q_len.view(b, 1, 1)) & row_active.unsqueeze(2)
+        vals = token_ids.gather(
+            1, idx.clamp(0, s - 1).reshape(b, n * k)).reshape(b, n, k)
+        return torch.where(valid_idx, vals, -1)
+
+    def gather_soft(
+        self,
+        num_tokens_no_spec: torch.Tensor,
+        token_ids: torch.Tensor,
+        combined_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Soft backoff: one weighted ensemble over all match lengths.
+
+        Instead of C hard (length, support) candidates, take the R
+        best occurrence sites ranked by (match length desc, position
+        asc) and let every site vote with weight
+        ``soft_lambda ** (L_max - mb[site])`` — an interpolated
+        backoff over all suffix orders at once (single expand, C=1).
+
+        Returns:
+            (match_len [B, 1] i64 = longest match,
+             cont [B, 1, R, K] int32, occ_count [B, 1] i64,
+             weights [B, R] f32).
+        """
+        b, s = token_ids.shape
+        r = self.max_occurrences
+        device = token_ids.device
+        mb, q_len, valid_i, pos = self._compute_match_back(
+            num_tokens_no_spec, token_ids)
+
+        eligible = (mb >= self.min_match_len) & valid_i \
+            & combined_mask.unsqueeze(1)
+        mb_e = torch.where(eligible, mb, torch.zeros_like(mb))
+        # Rank: longer match first, earlier position first within a
+        # length. All eligible keys exceed every ineligible key.
+        key = (mb_e.to(torch.int64) * (s + 1)
+               + (s - 1 - pos.to(torch.int64)).unsqueeze(0))
+        width = min(r, s)
+        top_key = torch.topk(key, width, dim=1).values  # [B, width]
+        if width < r:
+            top_key = torch.cat(
+                [top_key, torch.zeros(b, r - width, dtype=torch.int64,
+                                      device=device)], dim=1)
+        top_mb = top_key // (s + 1)                    # [B, R]
+        top_pos = (s - 1) - (top_key % (s + 1))
+        n_occ = eligible.sum(dim=1).clamp(max=r)       # [B]
+        row_active = (torch.arange(r, device=device).view(1, r)
+                      < n_occ.unsqueeze(1))
+        occ_end = torch.where(row_active, top_pos,
+                              torch.zeros_like(top_pos))
+
+        match_len = top_mb[:, 0].clamp(min=0)          # longest match
+        weights = torch.pow(
+            torch.full((), self.soft_lambda, dtype=torch.float32,
+                       device=device),
+            (match_len.unsqueeze(1) - top_mb).to(torch.float32).clamp(
+                min=0))
+        weights = torch.where(row_active, weights,
+                              torch.zeros_like(weights))
+
+        cont = self._gather_cont_at(token_ids, q_len, occ_end,
+                                    row_active)
+        return (match_len.unsqueeze(1), cont.unsqueeze(1),
+                n_occ.unsqueeze(1), weights)
+
+    def gather_candidates(
+        self,
+        num_tokens_no_spec: torch.Tensor,
+        token_ids: torch.Tensor,
+        combined_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Backoff candidate lengths with continuation blocks.
+
+        Returns:
+            (cand [B, C] i64 candidate match lengths,
+             cont [B, C, R, K] int32 continuations (-1 padded),
+             occ_count [B, C] i64 occurrence counts).
+        """
+        b, s = token_ids.shape
+        k = self.k
+        r = self.max_occurrences
+        device = token_ids.device
+        mb, q_len, valid_i, pos = self._compute_match_back(
+            num_tokens_no_spec, token_ids)
 
         # Candidate lengths: the largest L with cnt(L) >= t occurrences
         # is exactly the t-th largest match_back value (cnt(L) =
@@ -195,6 +291,23 @@ class LocalMatchKernel(nn.Module):
         cont = torch.where(valid_idx, vals, -1)
         return cand, cont, occ_count
 
+    def gather(
+        self,
+        num_tokens_no_spec: torch.Tensor,
+        token_ids: torch.Tensor,
+        combined_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor | None]:
+        """Mode dispatch: (len [B,C], cont [B,C,R,K], occ [B,C],
+        weights [B, C*R] f32 or None)."""
+        if self.local_mode == "soft":
+            cand, cont, occ, w = self.gather_soft(
+                num_tokens_no_spec, token_ids, combined_mask)
+            return cand, cont, occ, w
+        cand, cont, occ = self.gather_candidates(
+            num_tokens_no_spec, token_ids, combined_mask)
+        return cand, cont, occ, None
+
     def forward(
         self,
         num_tokens_no_spec: torch.Tensor,
@@ -217,16 +330,17 @@ class LocalMatchKernel(nn.Module):
         k = self.k
         r = self.max_occurrences
         device = token_ids.device
-        cand, cont, occ_count = self.gather_candidates(
+        cand, cont, occ_count, weights = self.gather(
             num_tokens_no_spec, token_ids, combined_mask)
         c = cand.shape[1]
         cont_all = cont.reshape(b * c, r, k)
         occ_all = occ_count.reshape(b * c)
+        w_all = None if weights is None else weights.reshape(b * c, r)
 
         cap = self._spec_cap(cand.reshape(b * c))
         chain, _, num_emit, score = expand_chain(
             cont_all, occ_all, k, min_token_prob=self.min_token_prob,
-            cap=cap, alpha=self.vote_smoothing_alpha)
+            cap=cap, weights=w_all, alpha=self.vote_smoothing_alpha)
 
         score = score.reshape(b, c)
         num_emit = num_emit.reshape(b, c)
