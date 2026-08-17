@@ -54,6 +54,35 @@ from benchmarks.bench_vs_cpu import SimResult, accept_len  # noqa: E402
 from suffix_gpu.proposer import SuffixGPUDrafter  # noqa: E402
 
 DEFAULT_DATA = str(Path.home() / "question.jsonl")
+
+LEGACY_PRESET = dict(vote_smoothing_alpha=0.0, local_mode="backoff",
+                     merge_paths=False, dynamic_k=False,
+                     eviction="fifo")
+
+
+def preset_extra(args) -> dict:
+    """Drafter kwargs for --preset (v2 = branch defaults)."""
+    extra = {}
+    if args.preset == "legacy":
+        extra.update(LEGACY_PRESET)
+    if args.max_occurrences is not None:
+        extra["max_occurrences"] = args.max_occurrences
+    if args.num_backoff is not None:
+        extra["num_backoff"] = args.num_backoff
+    if args.alpha is not None:
+        extra["vote_smoothing_alpha"] = args.alpha
+    if args.local_mode is not None:
+        extra["local_mode"] = args.local_mode
+    if args.soft_lambda is not None:
+        extra["soft_lambda"] = args.soft_lambda
+    if args.merge_paths is not None:
+        extra["merge_paths"] = bool(args.merge_paths)
+    if args.dynamic_k is not None:
+        extra["dynamic_k"] = bool(args.dynamic_k)
+    if args.eviction is not None:
+        extra["eviction"] = args.eviction
+    return extra
+
 DEFAULT_TOKENIZER = "NousResearch/Meta-Llama-3.1-8B-Instruct"
 DEFAULT_CATEGORIES = ("translation", "summarization", "math_reasoning")
 
@@ -266,11 +295,7 @@ def run_replay(args, device: torch.device, data) -> None:
         for enable_global, use_graph, tag in variants:
             if use_graph and device.type != "cuda":
                 continue
-            extra = {}
-            if args.max_occurrences is not None:
-                extra["max_occurrences"] = args.max_occurrences
-            if args.num_backoff is not None:
-                extra["num_backoff"] = args.num_backoff
+            extra = preset_extra(args)
             drafter = SuffixGPUDrafter(
                 k=args.k, device=device, max_pattern_len=args.depth,
                 min_match_len=1,
@@ -306,11 +331,7 @@ def run_agreement(args, device: torch.device, data) -> None:
 
         cache = SuffixDecodingCache(max_tree_depth=args.depth,
                                     max_cached_requests=1000)
-        extra = {}
-        if args.max_occurrences is not None:
-            extra["max_occurrences"] = args.max_occurrences
-        if args.num_backoff is not None:
-            extra["num_backoff"] = args.num_backoff
+        extra = preset_extra(args)
         drafter = SuffixGPUDrafter(
             k=args.k, device=device, max_pattern_len=args.depth,
             min_match_len=1, enable_global=False,
@@ -423,11 +444,7 @@ def run_scale(args, device: torch.device, data) -> None:
         del cache
 
         # --- GPU: same warm state ---
-        extra = {}
-        if args.max_occurrences is not None:
-            extra["max_occurrences"] = args.max_occurrences
-        if args.num_backoff is not None:
-            extra["num_backoff"] = args.num_backoff
+        extra = preset_extra(args)
         drafter = SuffixGPUDrafter(
             k=args.k, device=device, max_pattern_len=args.depth,
             min_match_len=1, enable_global=True,
@@ -505,6 +522,15 @@ def main() -> None:
                     help="override drafter max_occurrences (default: class default)")
     ap.add_argument("--num-backoff", type=int, default=None,
                     help="override drafter num_backoff (default: class default)")
+    ap.add_argument("--preset", choices=["v2", "legacy"], default="v2",
+                    help="drafter preset: v2 = branch defaults")
+    ap.add_argument("--alpha", type=float, default=None)
+    ap.add_argument("--local-mode", choices=["soft", "backoff"],
+                    default=None)
+    ap.add_argument("--soft-lambda", type=float, default=None)
+    ap.add_argument("--merge-paths", type=int, default=None)
+    ap.add_argument("--dynamic-k", type=int, default=None)
+    ap.add_argument("--eviction", choices=["fifo", "lfu"], default=None)
     args = ap.parse_args()
 
     from transformers import AutoTokenizer

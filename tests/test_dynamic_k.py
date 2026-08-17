@@ -85,3 +85,15 @@ def _step_like(drafter, buf):
     draft, nv, new_counts = drafter.propose_with_update(
         counts, buf, sampled)
     return int(nv[0].item()), int(new_counts[0].item())
+
+
+def test_env_preset_legacy(device, monkeypatch):
+    monkeypatch.setenv("SUFFIX_GPU_PRESET", "legacy")
+    d = SuffixGPUDrafter(k=4, device=device, max_pattern_len=8,
+                         max_occurrences=8, enable_global=True,
+                         global_capacity=256, delta_capacity=64)
+    assert d.vote_smoothing_alpha == 0.0
+    assert d.local_mode == "backoff"
+    assert d.merge_paths is False
+    assert d.dynamic_k is False
+    assert d.global_index.eviction == "fifo"

@@ -15,6 +15,8 @@ expansion stops once the estimated chain probability falls below
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from suffix_gpu import triton_kernels
@@ -60,6 +62,15 @@ class SuffixGPUDrafter:
         lfu_protect_rebuilds: int = 1,
         parallel_paths: bool = True,
     ):
+        # Env preset for embedders whose config surface predates the
+        # v2 knobs (e.g. vLLM A/B runs): SUFFIX_GPU_PRESET=legacy
+        # restores the pre-v2 drafting semantics.
+        if os.environ.get("SUFFIX_GPU_PRESET", "").lower() == "legacy":
+            vote_smoothing_alpha = 0.0
+            local_mode = "backoff"
+            merge_paths = False
+            dynamic_k = False
+            eviction = "fifo"
         self.k = k
         self.device = torch.device(device)
         self.max_pattern_len = max_pattern_len

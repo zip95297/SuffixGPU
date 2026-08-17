@@ -71,6 +71,24 @@ from benchmarks.bench_vs_cpu import accept_len  # noqa: E402
 from suffix_gpu.proposer import SuffixGPUDrafter  # noqa: E402
 
 DEFAULT_DATA = str(Path.home() / "question.jsonl")
+
+_LEGACY_PRESET = dict(vote_smoothing_alpha=0.0, local_mode="backoff",
+                      merge_paths=False, dynamic_k=False,
+                      eviction="fifo")
+
+
+def _preset_extra(args) -> dict:
+    extra = {}
+    if args.preset == "legacy":
+        extra.update(_LEGACY_PRESET)
+    if args.max_occurrences is not None:
+        extra["max_occurrences"] = args.max_occurrences
+    if args.alpha is not None:
+        extra["vote_smoothing_alpha"] = args.alpha
+    if args.eviction is not None:
+        extra["eviction"] = args.eviction
+    return extra
+
 DEFAULT_TOKENIZER = "NousResearch/Meta-Llama-3.1-8B-Instruct"
 DEFAULT_CATEGORIES = ("translation", "summarization", "math_reasoning")
 
@@ -399,6 +417,7 @@ def run_variants(args, device: torch.device, data, vocab_size: int) -> int:
             min_token_prob=args.min_token_prob,
             rebuild_stream=torch.cuda.Stream(device)
             if device.type == "cuda" else None,
+            **_preset_extra(args),
         )
 
         for w in range(args.waves):
@@ -457,6 +476,10 @@ def main() -> int:
     ap.add_argument("--chunk", type=int, default=64,
                     help="ingest_active chunk size (engine writes at 64)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--preset", choices=["v2", "legacy"], default="v2")
+    ap.add_argument("--max-occurrences", type=int, default=None)
+    ap.add_argument("--alpha", type=float, default=None)
+    ap.add_argument("--eviction", choices=["fifo", "lfu"], default=None)
     ap.add_argument("--global-capacity", type=int, default=1 << 21)
     ap.add_argument("--delta-capacity", type=int, default=1 << 16)
     ap.add_argument("--fail-if-real-rate-delta", type=float, default=None,
