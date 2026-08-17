@@ -117,8 +117,94 @@ if HAS_TRITON:
             winner = act & (votes == mx) & (mx > 0)
             tok = tl.min(tl.where(winner, c, 2147483647), axis=0)
             nact = tl.maximum(tl.sum(act.to(tl.int32), axis=0), 1)
-            prob = prob * (mx.to(tl.float32) / nact.to(tl.float32))
+            # div_rn: correctly-rounded fp32 divide; the default '/'
+            # lowers to an approximate division whose 1-ULP error can
+            # flip the min_token_prob cutoff vs the torch reference.
+            prob = prob * tl.math.div_rn(mx.to(tl.float32),
+                                         nact.to(tl.float32))
             valid = (mx > 0) & (prob >= min_prob)
+            tl.store(chain_ptr + b * K + d, tl.where(valid, tok, -1))
+            score += tl.where(valid & (d < cap), prob, 0.0)
+            nv += valid.to(tl.int32)
+            ok = ok & (c == tok) & valid
+        tl.store(nv_ptr + b, nv)
+        cap0 = tl.maximum(cap, 0)
+        tl.store(nemit_ptr + b, tl.minimum(nv.to(tl.int64), cap0))
+        tl.store(score_ptr + b, score)
+
+    @triton.jit
+    def _scan_max(a, b):
+        return tl.maximum(a, b)
+
+    @triton.jit
+    def _expand_chain_kernel_v2(cont_ptr, nocc_ptr, cap_ptr, w_ptr,
+                                chain_ptr, nv_ptr, nemit_ptr, score_ptr,
+                                min_prob, alpha,
+                                R: tl.constexpr, K: tl.constexpr,
+                                RP: tl.constexpr, HAS_W: tl.constexpr):
+        # Sort-based majority vote: tokens are sorted per depth, equal
+        # tokens form contiguous runs, and the vote count of a run is
+        # its length (or weight sum). O(R log^2 R) vs the pairwise
+        # O(R^2), with identical results: max count wins, ties resolve
+        # to the smallest token (= first run in ascending order).
+        b = tl.program_id(0)
+        r = tl.arange(0, RP)
+        occ = tl.load(nocc_ptr + b)
+        cap = tl.load(cap_ptr + b)
+        ok = (r < R) & (r < occ)
+        INF = 2147483647
+        if HAS_W:
+            w = tl.load(w_ptr + b * R + r, mask=r < R, other=0.0)
+        nv = tl.zeros((), dtype=tl.int32)
+        prob = tl.zeros((), dtype=tl.float32) + 1.0
+        score = tl.zeros((), dtype=tl.float32)
+        # tl.range (not static_range): keep one sort instance in the
+        # IR; a static unroll would emit K copies of the sort network
+        # and blow up JIT compile time.
+        for d in tl.range(0, K):
+            c = tl.load(cont_ptr + b * R * K + r * K + d,
+                        mask=r < R, other=-1)
+            act = ok & (c != -1)
+            if HAS_W:
+                # Pack (token, row) so the row index survives the sort
+                # and weights can be gathered per sorted slot. Active
+                # tokens are >= 0 < INF, so inactive slots sort last.
+                key = tl.where(act, c, INF).to(tl.int64) * RP + r
+                skey = tl.sort(key, 0)
+                stok = (skey // RP).to(tl.int32)
+                sidx = (skey % RP).to(tl.int32)
+                sw = tl.gather(w, sidx, 0)
+            else:
+                stok = tl.sort(tl.where(act, c, INF), 0)
+            prev = tl.gather(stok, tl.maximum(r - 1, 0), 0)
+            neq = (r == 0) | (stok != prev)
+            first = tl.associative_scan(tl.where(neq, r, 0), 0, _scan_max)
+            nxt = tl.gather(neq.to(tl.int32), tl.minimum(r + 1, RP - 1), 0)
+            last = (r == RP - 1) | (nxt > 0)
+            validp = stok != INF
+            if HAS_W:
+                swv = tl.where(validp, sw, 0.0)
+                cw = tl.cumsum(swv, 0)
+                runw = cw - tl.gather(cw, first, 0) + tl.gather(swv,
+                                                                first, 0)
+                tot = tl.where(last & validp, runw, 0.0)
+                v_w = tl.max(tot, 0)
+                win = last & validp & (tot >= v_w) & (v_w > 0)
+                tok = tl.min(tl.where(win, stok, INF), 0)
+                a_w = tl.sum(tl.where(act, w, 0.0), 0)
+                prob = prob * tl.math.div_rn(v_w, a_w + alpha)
+                has_vote = v_w > 0
+            else:
+                runl = r - first + 1
+                tot = tl.where(last & validp, runl, 0)
+                v_i = tl.max(tot, 0)
+                win = last & validp & (tot == v_i) & (v_i > 0)
+                tok = tl.min(tl.where(win, stok, INF), 0)
+                nact = tl.maximum(tl.sum(act.to(tl.int32), axis=0), 1)
+                prob = prob * tl.math.div_rn(
+                    v_i.to(tl.float32), nact.to(tl.float32) + alpha)
+                has_vote = v_i > 0
+            valid = has_vote & (prob >= min_prob)
             tl.store(chain_ptr + b * K + d, tl.where(valid, tok, -1))
             score += tl.where(valid & (d < cap), prob, 0.0)
             nv += valid.to(tl.int32)
@@ -218,9 +304,47 @@ def sa_search(sa: torch.Tensor, corpus: torch.Tensor,
 
 def expand_chain(cont: torch.Tensor, num_occ: torch.Tensor, k: int,
                  min_token_prob: float,
-                 cap: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor,
-                                             torch.Tensor, torch.Tensor]:
-    """Majority-vote chain expansion with fused scoring (one launch)."""
+                 cap: torch.Tensor,
+                 weights: torch.Tensor | None = None,
+                 alpha: float = 0.0) -> tuple[torch.Tensor, torch.Tensor,
+                                              torch.Tensor, torch.Tensor]:
+    """Majority-vote chain expansion with fused scoring (one launch).
+
+    Sort-based run-length voting (v2): identical results to the
+    pairwise kernel for unweighted votes, plus optional per-occurrence
+    ``weights`` (vote mass) and Laplace smoothing ``alpha``
+    (p = v / (max(a, 1) + alpha) unweighted, v_w / (a_w + alpha)
+    weighted).
+    """
+    b, r, _ = cont.shape
+    cont = cont.to(torch.int32).contiguous()
+    nocc = num_occ.to(torch.int64).contiguous()
+    capc = cap.to(torch.int64).contiguous()
+    chain = torch.empty(b, k, dtype=torch.int32, device=cont.device)
+    nv = torch.empty(b, dtype=torch.int32, device=cont.device)
+    nemit = torch.empty(b, dtype=torch.int64, device=cont.device)
+    score = torch.empty(b, dtype=torch.float32, device=cont.device)
+    rp = max(triton.next_power_of_2(r), 2)
+    if weights is None:
+        wt = score  # dummy pointer, never read under HAS_W=False
+        has_w = False
+    else:
+        wt = weights.to(torch.float32).contiguous()
+        has_w = True
+    _expand_chain_kernel_v2[(b,)](cont, nocc, capc, wt, chain, nv, nemit,
+                                  score, float(min_token_prob),
+                                  float(alpha), R=r, K=k, RP=rp,
+                                  HAS_W=has_w)
+    return chain, nv.to(torch.int64), nemit, score
+
+
+def expand_chain_pairwise(cont: torch.Tensor, num_occ: torch.Tensor,
+                          k: int, min_token_prob: float,
+                          cap: torch.Tensor) -> tuple[torch.Tensor,
+                                                      torch.Tensor,
+                                                      torch.Tensor,
+                                                      torch.Tensor]:
+    """Legacy O(R^2) pairwise-vote kernel (kept as test oracle)."""
     b, r, _ = cont.shape
     cont = cont.to(torch.int32).contiguous()
     nocc = num_occ.to(torch.int64).contiguous()

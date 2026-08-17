@@ -63,7 +63,9 @@ class GlobalIndex:
         self.corpus = torch.full((capacity,), PAD_TOKEN, dtype=torch.int32,
                                  device=self.device)
         self.staging_corpus = self.corpus.clone()
-        self.sa = torch.arange(capacity, dtype=torch.int64,
+        # int32: capacity is far below 2^31, and halving the SA element
+        # size halves the gather traffic of the binary search.
+        self.sa = torch.arange(capacity, dtype=torch.int32,
                                device=self.device)
         self.staging_sa = self.sa.clone()
         self.delta = torch.zeros(delta_capacity, dtype=torch.int32,
@@ -213,12 +215,12 @@ class GlobalIndex:
             self._finish_swap(n_new, new_doc_lens)
 
     def _build_staging_sa(self, dst: torch.Tensor, m: int) -> None:
-        self.staging_sa[:m] = build_suffix_array(dst[:m])
+        self.staging_sa[:m] = build_suffix_array(dst[:m]).to(torch.int32)
         if m < self.capacity:
             # All-sentinel suffixes compare greater than any real
             # pattern, so any internal order is valid for search.
             self.staging_sa[m:] = torch.arange(
-                m, self.capacity, dtype=torch.int64, device=self.device)
+                m, self.capacity, dtype=torch.int32, device=self.device)
 
     def _count_docs_within(self, tokens: int) -> int:
         acc = 0
@@ -321,6 +323,18 @@ class GlobalIndex:
         zero = torch.zeros(b, cnum, dtype=torch.int64, device=device)
         match_len = torch.where(use_sa, sa_len,
                                 torch.where(use_delta, d_len, zero))
+        # Adjacent caps that resolve to the same (length, tier) share
+        # the occurrence set and would draft identical chains; zero the
+        # later copies (score argmax keeps the first).
+        if cnum > 1:
+            src = use_sa.to(torch.int8) + 2 * use_delta.to(torch.int8)
+            dup = torch.zeros_like(use_sa)
+            dup[:, 1:] = ((match_len[:, 1:] == match_len[:, :-1])
+                          & (src[:, 1:] == src[:, :-1])
+                          & (match_len[:, 1:] > 0))
+            use_sa = use_sa & ~dup
+            use_delta = use_delta & ~dup
+            match_len = torch.where(dup, zero, match_len)
 
         # Sample the SA interval: sequential when it fits, strided
         # otherwise (the interval is ordered by continuation, so taking
@@ -365,6 +379,7 @@ class GlobalIndex:
         max_spec_factor: float | None = None,
         max_spec_offset: float = 0.0,
         caps: torch.Tensor | None = None,
+        alpha: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
                torch.Tensor]:
         """Multi-length scored draft over corpus + delta.
@@ -407,7 +422,7 @@ class GlobalIndex:
         chain, _, num_emit, score = expand_chain(
             cont.reshape(b * cnum, self.max_occurrences, k),
             occ_count.reshape(b * cnum), k,
-            min_token_prob=min_token_prob, cap=cap_emit)
+            min_token_prob=min_token_prob, cap=cap_emit, alpha=alpha)
 
         score = score.reshape(b, cnum)
         # First max = longest cap (caps are descending), matching the

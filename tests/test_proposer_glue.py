@@ -8,11 +8,14 @@ K = 4
 P = 8
 
 
+LEGACY = dict(vote_smoothing_alpha=0.0)
+
+
 def _drafter(device, enable_global=False, **kw):
     return SuffixGPUDrafter(
         k=K, device=device, max_pattern_len=P, max_occurrences=8,
         enable_global=enable_global, global_capacity=1024,
-        delta_capacity=256, rebuild_threshold=100000, **kw)
+        delta_capacity=256, rebuild_threshold=100000, **LEGACY, **kw)
 
 
 def test_update_state_scatter(device):
