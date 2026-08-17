@@ -58,6 +58,7 @@ class SuffixGPUDrafter:
         eviction: str = "lfu",
         lfu_decay: float = 0.5,
         lfu_protect_rebuilds: int = 1,
+        parallel_paths: bool = True,
     ):
         self.k = k
         self.device = torch.device(device)
@@ -98,6 +99,13 @@ class SuffixGPUDrafter:
         self._last_w: torch.Tensor | None = None
         self._last_tier: torch.Tensor | None = None
         self._last_epoch = -1
+        # parallel_paths: run the global match phase (SA walk + delta
+        # scan) on a side stream concurrently with the local match
+        # phase; fork/join via events, capturable into CUDA graphs.
+        self.parallel_paths = bool(parallel_paths)
+        self._ps_stream: torch.cuda.Stream | None = None
+        self._ps_fork: torch.cuda.Event | None = None
+        self._ps_join: torch.cuda.Event | None = None
         # Local candidates: support thresholds 2^0 .. 2^(C-1) (arctic's
         # length/support Pareto frontier gets denser as C grows).
         support_thresholds = tuple(
@@ -351,14 +359,44 @@ class SuffixGPUDrafter:
         else:
             kd = self._dyn_cap(b)
             r = self.local_kernel.max_occurrences
-            cand_l, cont_l, occ_l, w_l = self.local_kernel.gather(
-                num_tokens_no_spec, token_ids_gpu, combined_mask)
             tails, tail_len = self._gather_tails(num_tokens_no_spec,
                                                  token_ids_gpu)
-            g_len, g_cont, g_occ, g_pos, g_tier = \
-                self.global_index._query_backoff(
-                    tails.to(torch.int32), tail_len,
-                    self.max_pattern_len, self._global_caps)
+            use_ps = (self.parallel_paths
+                      and self.device.type == "cuda")
+            if use_ps:
+                if self._ps_stream is None:
+                    self._ps_stream = torch.cuda.Stream(self.device)
+                    self._ps_fork = torch.cuda.Event()
+                    self._ps_join = torch.cuda.Event()
+                cur = torch.cuda.current_stream(self.device)
+                self._ps_fork.record(cur)
+                capturing = torch.cuda.is_current_stream_capturing()
+                with torch.cuda.stream(self._ps_stream):
+                    self._ps_stream.wait_event(self._ps_fork)
+                    if not capturing:
+                        # Allocator hint: tails is main-stream memory
+                        # read on the side stream.
+                        tails.record_stream(self._ps_stream)
+                        tail_len.record_stream(self._ps_stream)
+                    g_len, g_cont, g_occ, g_pos, g_tier = \
+                        self.global_index._query_backoff(
+                            tails.to(torch.int32), tail_len,
+                            self.max_pattern_len, self._global_caps)
+                    self._ps_join.record(self._ps_stream)
+                # Local match runs concurrently on the main stream.
+                cand_l, cont_l, occ_l, w_l = self.local_kernel.gather(
+                    num_tokens_no_spec, token_ids_gpu, combined_mask)
+                cur.wait_event(self._ps_join)
+                if not capturing:
+                    for t in (g_len, g_cont, g_occ, g_pos, g_tier):
+                        t.record_stream(cur)
+            else:
+                cand_l, cont_l, occ_l, w_l = self.local_kernel.gather(
+                    num_tokens_no_spec, token_ids_gpu, combined_mask)
+                g_len, g_cont, g_occ, g_pos, g_tier = \
+                    self.global_index._query_backoff(
+                        tails.to(torch.int32), tail_len,
+                        self.max_pattern_len, self._global_caps)
 
             cl = cand_l.shape[1]
             cg = g_len.shape[1]
