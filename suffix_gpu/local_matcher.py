@@ -313,6 +313,7 @@ class LocalMatchKernel(nn.Module):
         num_tokens_no_spec: torch.Tensor,
         token_ids: torch.Tensor,
         combined_mask: torch.Tensor,
+        cap_limit: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
                torch.Tensor]:
         """Match and draft on per-request token buffers.
@@ -321,6 +322,7 @@ class LocalMatchKernel(nn.Module):
             num_tokens_no_spec: [B] int32 token counts.
             token_ids: [B, S] int32 token buffer.
             combined_mask: [B] bool rows allowed to draft.
+            cap_limit: optional [B] i64 additional emission cap.
 
         Returns:
             (draft_tokens [B, k] int32, num_valid [B] int32,
@@ -338,6 +340,10 @@ class LocalMatchKernel(nn.Module):
         w_all = None if weights is None else weights.reshape(b * c, r)
 
         cap = self._spec_cap(cand.reshape(b * c))
+        if cap_limit is not None:
+            cap = torch.minimum(
+                cap.view(b, c),
+                cap_limit.to(torch.int64).unsqueeze(1)).reshape(-1)
         chain, _, num_emit, score = expand_chain(
             cont_all, occ_all, k, min_token_prob=self.min_token_prob,
             cap=cap, weights=w_all, alpha=self.vote_smoothing_alpha)

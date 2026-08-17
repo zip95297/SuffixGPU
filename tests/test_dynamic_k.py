@@ -1,0 +1,87 @@
+"""Dynamic-k: the accept-length EMA modulates the emission cap."""
+
+from __future__ import annotations
+
+import torch
+
+from suffix_gpu.proposer import SuffixGPUDrafter
+
+K = 8
+
+
+def _drafter(device):
+    return SuffixGPUDrafter(
+        k=K, device=device, max_pattern_len=8, max_occurrences=8,
+        dynamic_k=True, ema_decay=0.5, dyn_k_scale=1.0,
+        dyn_k_offset=0.0, dyn_k_min=1)
+
+
+def _step(drafter, buf, nts, accepted_plus_one):
+    sampled = torch.full((1, K + 1), -1, dtype=torch.int32,
+                         device=buf.device)
+    period = [1, 2, 3, 4]
+    for j in range(accepted_plus_one):
+        sampled[0, j] = period[(nts + j) % 4]
+    counts = torch.tensor([nts], dtype=torch.int32, device=buf.device)
+    draft, nv, new_counts = drafter.propose_with_update(
+        counts, buf, sampled)
+    return int(nv[0].item()), int(new_counts[0].item())
+
+
+def test_dynamic_k_cap_follows_accept_ema(device):
+    d = _drafter(device)
+    buf = torch.zeros(1, 64, dtype=torch.int32, device=device)
+    pattern = ([1, 2, 3, 4] * 5)[:20]
+    buf[0, :20] = torch.tensor(pattern, dtype=torch.int32)
+
+    # Step 1: 4 valid sampled ids => accepted 3 => EMA 1.5 => cap 2.
+    nv, nts = _step(d, buf, 20, 4)
+    assert nts == 24
+    assert nv == 2
+
+    # Step 2: EMA 0.5*1.5 + 0.5*3 = 2.25 => cap 3.
+    nv, nts = _step(d, buf, nts, 4)
+    assert nts == 28
+    assert nv == 3
+
+    # Row recycled: EMA reset => standalone propose sees cap dyn_k_min.
+    d.reset_rows([0])
+    lens = torch.tensor([nts], dtype=torch.int32, device=device)
+    _, nv_t = d.propose(lens, buf)
+    assert nv_t[0].item() == 1
+    # The next update_state relearns from its accept count (EMA 1.5
+    # => cap 2) before drafting.
+    nv, nts = _step(d, buf, nts, 4)
+    assert nv == 2
+
+
+def test_dynamic_k_uncapped_before_history(device):
+    # No update_state yet: EMA buffer absent, no cap applied.
+    d = _drafter(device)
+    buf = torch.zeros(1, 64, dtype=torch.int32, device=device)
+    buf[0, :20] = torch.tensor(([1, 2, 3, 4] * 5)[:20],
+                               dtype=torch.int32)
+    lens = torch.tensor([20], dtype=torch.int32, device=device)
+    draft, nv = d.propose(lens, buf)
+    assert nv[0].item() > 3
+
+
+def test_dynamic_k_off_is_uncapped(device):
+    d = SuffixGPUDrafter(
+        k=K, device=device, max_pattern_len=8, max_occurrences=8,
+        dynamic_k=False)
+    buf = torch.zeros(1, 64, dtype=torch.int32, device=device)
+    buf[0, :20] = torch.tensor(([1, 2, 3, 4] * 5)[:20],
+                               dtype=torch.int32)
+    nv, _ = _step_like(d, buf)
+    assert nv > 3
+
+
+def _step_like(drafter, buf):
+    sampled = torch.full((1, K + 1), -1, dtype=torch.int32,
+                         device=buf.device)
+    sampled[0, 0] = 1
+    counts = torch.tensor([20], dtype=torch.int32, device=buf.device)
+    draft, nv, new_counts = drafter.propose_with_update(
+        counts, buf, sampled)
+    return int(nv[0].item()), int(new_counts[0].item())

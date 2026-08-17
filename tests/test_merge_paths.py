@@ -19,7 +19,7 @@ def _drafter(device, merge_paths):
         enable_global=True, global_capacity=1 << 10,
         delta_capacity=1 << 8, rebuild_threshold=1 << 9,
         min_token_prob=0.5, vote_smoothing_alpha=1.0,
-        local_mode="soft", merge_paths=merge_paths)
+        local_mode="soft", merge_paths=merge_paths, dynamic_k=False)
 
 
 def _setup(drafter, device):

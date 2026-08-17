@@ -91,7 +91,7 @@ def test_proposer_contract(device):
                                max_occurrences=R,
                                vote_smoothing_alpha=0.0,
                                local_mode="backoff",
-                               merge_paths=False)
+                               merge_paths=False, dynamic_k=False)
     seq = [1, 2, 3, 4, 1, 2, 3, 4, 9, 1, 2, 3, 4]
     buf = torch.tensor([seq], dtype=torch.int32, device=device)
     lens = torch.tensor([len(seq)], dtype=torch.int32, device=device)

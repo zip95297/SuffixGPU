@@ -86,7 +86,7 @@ def test_soft_drafter_with_global_smoke(device):
         k=K, device=device, max_pattern_len=P, max_occurrences=R,
         enable_global=True, global_capacity=1 << 12,
         delta_capacity=1 << 8, rebuild_threshold=1 << 6,
-        local_mode="soft")
+        local_mode="soft", dynamic_k=False)
     doc = [4, 5, 6, 7, 4, 5, 6, 7, 4, 5]
     buf = torch.zeros(2, 32, dtype=torch.int32, device=device)
     buf[0, :len(doc)] = torch.tensor(doc, dtype=torch.int32)

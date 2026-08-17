@@ -50,6 +50,11 @@ class SuffixGPUDrafter:
         local_mode: str = "soft",
         soft_lambda: float = 0.5,
         merge_paths: bool = True,
+        dynamic_k: bool = True,
+        ema_decay: float = 0.8,
+        dyn_k_scale: float = 1.5,
+        dyn_k_offset: float = 1.0,
+        dyn_k_min: int = 2,
     ):
         self.k = k
         self.device = torch.device(device)
@@ -72,6 +77,15 @@ class SuffixGPUDrafter:
         # occurrence sets; the joint draft wins only on a strictly
         # greater score than either path alone.
         self.merge_paths = bool(merge_paths)
+        # dynamic_k: per-row EMA of accepted draft lengths modulates
+        # the emission cap (fewer wasted verification slots on rows
+        # that rarely accept). All device-side, CUDA-graph safe.
+        self.dynamic_k = bool(dynamic_k)
+        self.ema_decay = float(ema_decay)
+        self.dyn_k_scale = float(dyn_k_scale)
+        self.dyn_k_offset = float(dyn_k_offset)
+        self.dyn_k_min = int(dyn_k_min)
+        self._accept_ema: torch.Tensor | None = None
         # Local candidates: support thresholds 2^0 .. 2^(C-1) (arctic's
         # length/support Pareto frontier gets denser as C grows).
         support_thresholds = tuple(
@@ -138,6 +152,38 @@ class SuffixGPUDrafter:
         if self.global_index is not None:
             self.global_index.poll_rebuild()
 
+    # ------------------------------------------------------------------
+    # dynamic-k accept EMA
+    # ------------------------------------------------------------------
+    def _ensure_ema(self, b: int) -> torch.Tensor:
+        if self._accept_ema is None or self._accept_ema.shape[0] < b:
+            fresh = torch.zeros(b, dtype=torch.float32,
+                                device=self.device)
+            if self._accept_ema is not None:
+                fresh[: self._accept_ema.shape[0]] = self._accept_ema
+            self._accept_ema = fresh
+        return self._accept_ema
+
+    def reset_rows(self, row_indices: torch.Tensor | list[int]) -> None:
+        """Clear per-row drafter state when batch rows are recycled."""
+        if self._accept_ema is None:
+            return
+        if not torch.is_tensor(row_indices):
+            if not row_indices:
+                return
+            row_indices = torch.tensor(row_indices, dtype=torch.int64,
+                                       device=self.device)
+        self._accept_ema[row_indices] = 0.0
+
+    def _dyn_cap(self, b: int) -> torch.Tensor | None:
+        """Per-row emission limit from the accept EMA, or None."""
+        if not self.dynamic_k or self._accept_ema is None \
+                or self._accept_ema.shape[0] < b:
+            return None
+        kd = torch.ceil(self.dyn_k_scale * self._accept_ema[:b]
+                        + self.dyn_k_offset)
+        return kd.to(torch.int64).clamp(self.dyn_k_min, self.k)
+
     def update_state(
         self,
         num_tokens_no_spec: torch.Tensor,
@@ -172,6 +218,12 @@ class SuffixGPUDrafter:
             valid_sampled_tokens_count = (
                 sampled_token_ids != -1).sum(dim=1)
         cnt = valid_sampled_tokens_count.to(torch.int64)
+        if self.dynamic_k:
+            ema = self._ensure_ema(b)
+            acc = (cnt - 1).clamp(min=0).to(torch.float32)
+            upd = (self.ema_decay * ema[:b]
+                   + (1.0 - self.ema_decay) * acc)
+            ema[:b] = torch.where(cnt > 0, upd, ema[:b])
         if triton_kernels.available(token_ids_gpu, sampled_token_ids):
             triton_kernels.scatter_append(
                 token_ids_gpu, base, cnt, sampled_token_ids)
@@ -248,8 +300,10 @@ class SuffixGPUDrafter:
 
         if self.global_index is None:
             (draft, num_valid, _, _, _) = self.local_kernel(
-                num_tokens_no_spec, token_ids_gpu, combined_mask)
+                num_tokens_no_spec, token_ids_gpu, combined_mask,
+                cap_limit=self._dyn_cap(b))
         else:
+            kd = self._dyn_cap(b)
             r = self.local_kernel.max_occurrences
             cand_l, cont_l, occ_l, w_l = self.local_kernel.gather(
                 num_tokens_no_spec, token_ids_gpu, combined_mask)
@@ -274,6 +328,10 @@ class SuffixGPUDrafter:
                                 device=self.device)],
                     dim=1).reshape(b * (cl + cg), r)
             cap_all = self.local_kernel._spec_cap(len_all.reshape(-1))
+            if kd is not None:
+                cap_all = torch.minimum(
+                    cap_all.view(b, cl + cg),
+                    kd.unsqueeze(1)).reshape(-1)
             chain, _, emit, score = expand_chain(
                 cont_all.reshape(b * (cl + cg), r, k),
                 occ_all.reshape(-1), k,
@@ -322,6 +380,8 @@ class SuffixGPUDrafter:
                 j_occ = torch.full((b,), 2 * r, dtype=torch.int64,
                                    device=self.device)
                 j_cap = self.local_kernel._spec_cap(l_len0)
+                if kd is not None:
+                    j_cap = torch.minimum(j_cap, kd)
                 j_chain, _, j_emit, j_score = expand_chain(
                     j_cont, j_occ, k,
                     min_token_prob=self.min_token_prob, cap=j_cap,
