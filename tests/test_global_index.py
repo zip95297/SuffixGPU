@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from collections import Counter
 
+import pytest
 import torch
 
 from suffix_gpu.global_index import GlobalIndex
 from suffix_gpu.proposer import SuffixGPUDrafter
-from suffix_gpu.reference import (naive_longest_suffix_match,
-                                  naive_occurrences)
+from suffix_gpu.reference import naive_longest_suffix_match, naive_occurrences
 
 K = 4
 R = 8
@@ -217,6 +217,90 @@ class _NeverDoneEvent:
 
     def query(self) -> bool:
         return False
+
+
+class _ReadyEvent:
+    def query(self) -> bool:
+        return True
+
+
+def _seed_pending_rebuild(index: GlobalIndex, ready: bool) -> None:
+    event = _ReadyEvent() if ready else _NeverDoneEvent()
+    docs = index.active_doc_lens.copy()
+    index._rebuild_event = event
+    index._pending = (index.active_len, docs)
+    index.pending_epoch = index.active_epoch + 1
+    index._pending_signature = index._snapshot_signature(
+        index.active_len, docs)
+
+
+def test_coordinated_rebuild_requires_explicit_commit(device):
+    idx = GlobalIndex(capacity=64, delta_capacity=16, k=K,
+                      max_occurrences=R, device=device,
+                      coordinated_rebuild=True)
+    _seed_pending_rebuild(idx, ready=True)
+
+    assert idx.rebuild_state().ready
+    assert not idx.poll_rebuild()
+    assert idx.active_epoch == 0
+    assert idx.pending_epoch == 1
+
+    idx.commit_rebuild(1)
+    assert idx.active_epoch == 1
+    assert idx.pending_epoch is None
+    assert idx.rebuild_state().snapshot_signature is None
+
+
+def test_coordinated_rebuild_rejects_wrong_or_unready_epoch(device):
+    idx = GlobalIndex(capacity=64, delta_capacity=16, k=K,
+                      max_occurrences=R, device=device,
+                      coordinated_rebuild=True)
+    _seed_pending_rebuild(idx, ready=False)
+
+    with pytest.raises(RuntimeError, match="pending=1"):
+        idx.commit_rebuild(2)
+    with pytest.raises(RuntimeError, match="not ready"):
+        idx.commit_rebuild(1)
+    assert idx.active_epoch == 0
+    assert idx.pending_epoch == 1
+
+
+def test_default_rebuild_poll_keeps_local_commit_behavior(device):
+    idx = GlobalIndex(capacity=64, delta_capacity=16, k=K,
+                      max_occurrences=R, device=device)
+    _seed_pending_rebuild(idx, ready=True)
+
+    assert idx.poll_rebuild()
+    assert idx.active_epoch == 1
+    assert idx.pending_epoch is None
+
+
+def test_coordinated_cuda_rebuild_stays_pending_until_commit(device):
+    if device.type != "cuda":
+        pytest.skip("CUDA stream rebuild required")
+    idx = GlobalIndex(
+        capacity=1024,
+        delta_capacity=256,
+        k=K,
+        max_occurrences=R,
+        rebuild_threshold=1,
+        device=device,
+        rebuild_stream=torch.cuda.Stream(device),
+        coordinated_rebuild=True,
+    )
+    _append(idx, [[5, 6, 7, 8, 9]], device)
+    assert idx.pending_epoch == 1
+
+    torch.cuda.synchronize(device)
+    state = idx.rebuild_state()
+    assert state.ready
+    assert state.snapshot_signature is not None
+    assert not idx.poll_rebuild()
+    assert idx.active_epoch == 0
+
+    idx.commit_rebuild(1)
+    assert idx.active_epoch == 1
+    assert idx.pending_epoch is None
 
 
 def test_delta_overflow_with_rebuild_in_flight(device):

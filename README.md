@@ -7,7 +7,9 @@ path fully onto the accelerator: variable-length suffix matching with
 frequency-greedy expansion, plus a cross-request global memory backed by a
 GPU suffix array. It mirrors the vLLM `ngram_gpu` proposer contract — device
 tensors in, device tensors out, **no per-step host synchronization** — so it
-composes with async scheduling and CUDA-graph capture.
+composes with async scheduling and CUDA-graph capture. Multi-TP deployments use
+a low-frequency CPU control collective only while a suffix-array rebuild is
+pending; the GPU draft path remains asynchronous.
 
 ## Highlights
 
@@ -62,10 +64,10 @@ import torch
 from suffix_gpu import SuffixGPUDrafter
 
 drafter = SuffixGPUDrafter(
-    k=16,                  # max draft tokens per request
+    k=5,                   # max draft tokens per request
     device="cuda",
     enable_global=True,    # cross-request suffix-array memory
-    max_spec_factor=2.0,   # adaptive cap: factor * match_len + offset
+    max_spec_factor=0.5,   # adaptive cap: factor * match_len + offset
     min_token_prob=0.1,    # stop expanding when chain prob drops below
 )
 
@@ -102,9 +104,163 @@ when you manage state updates yourself.
 | `delta_capacity` | `1<<16` | Append-only delta buffer capacity |
 | `rebuild_threshold` | `delta_capacity // 2` | Delta fill level that triggers a background SA rebuild |
 | `rebuild_stream` | `None` | CUDA stream for background rebuilds |
+| `coordinated_rebuild` | `False` | Disable rank-local auto-commit so an external TP coordinator can commit a ready epoch on every rank together |
 | `max_spec_factor` / `max_spec_offset` | `None` / `0.0` | Adaptive draft-length cap: `factor * match_len + offset` |
 | `min_token_prob` | `0.0` | Cumulative-probability cutoff during expansion |
 | `num_backoff` | `8` | Candidate match lengths per path: local support thresholds `2^0..2^(C-1)`, global capped lengths halving from `max_pattern_len` (plus a final 2; distinct caps saturate at ~log2 of the pattern length). `1` = longest match only; larger values probe more lengths at small marginal cost |
+
+## Multi-TP rebuild consistency
+
+### The race
+
+The global suffix array is rebuilt independently on each TP rank. The old
+implementation let every rank run the following local decision:
+
+```python
+if rebuild_event.query():
+    finish_swap()
+```
+
+A CUDA event only describes one GPU. If rank 0 observes its event as complete
+while rank 1 still observes `not ready`, rank 0 queries the new suffix array and
+rank 1 queries the old one during the same logical proposal. The resulting
+draft IDs or valid-draft counts can differ before the next TP target forward.
+A targeted fault-injection test reproduced exactly that state: one rank drafted
+five tokens from the new index while the other drafted zero from the old index.
+
+### Implemented protocol
+
+This branch adds an externally coordinated rebuild state machine:
+
+```text
+active_epoch
+pending_epoch
+local CUDA completion event
+snapshot-layout signature = (new active length, document count,
+                             document-length fingerprint)
+```
+
+`GlobalIndex.rebuild_state()` queries the local event without waiting for it.
+`GlobalIndex.commit_rebuild(epoch)` is the only coordinated-mode path that can
+install the staging buffers. Internal calls from `maybe_rebuild()` and
+`_make_room()` can no longer commit based on a rank-local event.
+
+The vLLM integration gathers this small host state through the existing TP
+Gloo `cpu_group`:
+
+```text
+1. Every rank launches the same deterministic rebuild epoch.
+2. A pending rank reports active epoch, pending epoch, local_ready and the
+   snapshot signature.
+3. The CPU collective gathers those records and validates that epoch and
+   snapshot metadata are identical.
+4. If any local_ready is false, every rank keeps the old suffix array and the
+   current proposal/forward continues normally.
+5. Only when every local_ready is true does every rank commit the same epoch.
+```
+
+There is no `cudaEventSynchronize`, `torch.cuda.synchronize`, NCCL readiness
+flag, or GPU busy-wait. A slow rebuild merely keeps the old suffix array active
+for another proposal. The only host wait is the tiny Gloo collective between
+TP workers when a rebuild is pending.
+
+The current vLLM adapter receives identical scheduler outputs and performs
+global-index ingestion in the same order on every TP worker. That deterministic
+ingestion is the Phase-1 launch invariant. The gathered epoch and snapshot
+signature fail fast if the invariant is violated. A future executor that does
+not replicate ingestion must broadcast the rebuild command/snapshot before
+enabling the pending-only collective; otherwise a conditional collective could
+deadlock if only some ranks launched a rebuild.
+
+### Code boundaries
+
+- `suffix_gpu/global_index.py`: epoch state, snapshot signature, non-blocking
+  local readiness query, explicit commit, and coordinated-mode auto-commit
+  guard.
+- `suffix_gpu/proposer.py`: exposes rebuild state and commit without depending
+  on vLLM or any distributed package.
+- vLLM `v1/spec_decode/suffix_proposer_gpu.py`: owns the TP Gloo collective and
+  validates all rank records. No vLLM distributed-core change is required.
+
+Single-GPU and standalone users retain the old automatic local poll behavior;
+vLLM enables coordinated mode only when tensor parallel size is greater than
+one.
+
+### Profile results
+
+Measured with Qwen3-8B, TP=2, async scheduling, `k=5`, Spec-Bench c=64 and two
+RTX 4090 GPUs. Three consecutive natural rebuilds produced:
+
+| Epoch | Active tokens | Rank 0 rebuild | Rank 1 rebuild | Device completion skew | Poll arrival skew | First poll |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 32,803 | 11.012 ms | 10.993 ms | 67.2 us | 66.3 us | both ready |
+| 2 | 65,582 | 5.778 ms | 5.889 ms | 73.9 us | 154.5 us | both ready |
+| 3 | 98,486 | 5.525 ms | 5.588 ms | 18.4 us | 25.7 us | both ready |
+
+The TP launch skew was `36.9-86.5 us`. In this run the first poll reached each
+rank `0.44-0.66 ms` after the slower rebuild had completed, so the natural
+workload did not cross the race window. This does not make the old code safe:
+the injected-skew test crossed the same boundary and reproduced divergent
+draft state.
+
+An isolated TP2 one-int Gloo all-reduce benchmark over 2,000 iterations gave
+`196.5 us` p50, `227.4 us` p90 and `278.4 us` p99. The default rebuild threshold
+is about 32K new tokens. In the measured run the first coordinated poll already
+found both ranks ready, so one collective was amortized over roughly 26 seconds
+of output and its throughput cost was much smaller than 0.1%. If a poll arrives
+before every rank is ready, the collective repeats on the next proposal while
+the old index remains active. Nsight Systems was used to confirm the rebuild
+kernel/event timeline; CUDA API tracing perturbs enqueue latency, so serving
+throughput was measured without profiler instrumentation.
+
+### Recommended configuration from the Qwen3-8B sweep
+
+The best tested TP2 configuration was:
+
+```json
+{
+  "method": "suffix_gpu",
+  "num_speculative_tokens": 5,
+  "suffix_decoding_max_tree_depth": 24,
+  "suffix_decoding_max_cached_requests": 1000,
+  "suffix_decoding_max_spec_factor": 0.5,
+  "suffix_decoding_min_token_prob": 0.1,
+  "suffix_gpu_max_occurrences": 128,
+  "suffix_gpu_num_backoff": 8
+}
+```
+
+`parallel_paths` and CUDA graph replay remain enabled. The matching vLLM branch,
+also named `fix/tp-rebuild-consistency`, uses these values as the `suffix_gpu`
+defaults, including `k=5` when the window is omitted. This is the best result
+from the current Qwen3-8B/4090/TP2 sweep, not a universal optimum for every
+model and workload.
+
+The factor sweep at c=64/c=128 measured `1562/1678 tok/s` for factor 0.5,
+`1509/1596 tok/s` for 0.75 and `1413/1516 tok/s` for 1.0. Occurrence count 128
+was the strongest tested setting; `min_token_prob=0.1` remained marginally
+ahead of 0.2 and 0.3.
+
+### Fixed-branch serving result
+
+With the recommended defaults and coordinated poll enabled, Qwen3-8B TP2
+completed a 64-request warmup followed by 256 Spec-Bench requests at c=64:
+
+| Result | Value |
+| --- | ---: |
+| Completed / failed | 256 / 0 |
+| Output throughput | 1382.1 tok/s |
+| Total-token throughput | 2911.5 tok/s |
+| Mean TPOT | 41.42 ms |
+| Mean TTFT | 688.50 ms |
+
+The same-size earlier run with the old poll and old factor-1.0 configuration
+measured `1264.5 tok/s` and `45.30 ms` mean TPOT. This is not a clean estimate
+of collective overhead because the configuration changed at the same time;
+the improvement is primarily consistent with the factor sweep. Correctness is
+the meaningful result: all 256 requests completed, multiple default-threshold
+rebuilds occurred, and the TP collective neither hung nor reported an
+epoch/snapshot mismatch.
 
 ## How it works
 

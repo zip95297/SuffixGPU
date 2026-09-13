@@ -19,7 +19,7 @@ import torch
 
 from suffix_gpu import triton_kernels
 from suffix_gpu.expand import expand_chain
-from suffix_gpu.global_index import GlobalIndex
+from suffix_gpu.global_index import GlobalIndex, RebuildState
 from suffix_gpu.local_matcher import LocalMatchKernel, select_local_best
 
 
@@ -48,6 +48,7 @@ class SuffixGPUDrafter:
         num_backoff: int = 8,
         vote_smoothing_alpha: float = 0.0,
         parallel_paths: bool = True,
+        coordinated_rebuild: bool = False,
     ):
         self.k = k
         self.device = torch.device(device)
@@ -105,6 +106,7 @@ class SuffixGPUDrafter:
                 rebuild_threshold=rebuild_threshold,
                 device=self.device,
                 rebuild_stream=rebuild_stream,
+                coordinated_rebuild=coordinated_rebuild,
             )
 
     def _gather_tails(
@@ -124,13 +126,26 @@ class SuffixGPUDrafter:
             valid, token_ids_gpu.gather(1, idx.clamp(0, s - 1)), 0)
         return tails, tail_len
 
-    def poll(self) -> None:
+    def poll(self) -> bool:
         """Host-side: swap in a finished background rebuild, if any.
 
         Call once per step outside the (compile-safe) propose path.
         """
         if self.global_index is not None:
-            self.global_index.poll_rebuild()
+            return self.global_index.poll_rebuild()
+        return False
+
+    def rebuild_state(self) -> RebuildState | None:
+        """Return local global-index state for a multi-rank coordinator."""
+        if self.global_index is None:
+            return None
+        return self.global_index.rebuild_state()
+
+    def commit_rebuild(self, epoch: int) -> None:
+        """Commit an epoch after the coordinator reaches rank consensus."""
+        if self.global_index is None:
+            raise RuntimeError("global suffix index is disabled")
+        self.global_index.commit_rebuild(epoch)
 
     def update_state(
         self,
