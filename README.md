@@ -111,6 +111,9 @@ when you manage state updates yourself.
 
 ## Multi-TP rebuild consistency
 
+The complete benchmark and profile record is in
+[`docs/pr52097_tp_consistency_benchmark.md`](docs/pr52097_tp_consistency_benchmark.md).
+
 ### The race
 
 The global suffix array is rebuilt independently on each TP rank. The old
@@ -164,13 +167,37 @@ flag, or GPU busy-wait. A slow rebuild merely keeps the old suffix array active
 for another proposal. The only host wait is the tiny Gloo collective between
 TP workers when a rebuild is pending.
 
-The current vLLM adapter receives identical scheduler outputs and performs
-global-index ingestion in the same order on every TP worker. That deterministic
-ingestion is the Phase-1 launch invariant. The gathered epoch and snapshot
-signature fail fast if the invariant is violated. A future executor that does
-not replicate ingestion must broadcast the rebuild command/snapshot before
-enabling the pending-only collective; otherwise a conditional collective could
-deadlock if only some ranks launched a rebuild.
+The CPU collective alone is not sufficient: it guarantees when ranks switch,
+but not that they built the same suffix array. A real TP2 run reached the second
+rebuild with matching epochs, active length, and document count but different
+ordered-layout fingerprints:
+
+```text
+rank0: active_epoch=1 pending_epoch=2 active_len=65642 docs=791
+       fingerprint=8311849676532684854
+rank1: active_epoch=1 pending_epoch=2 active_len=65642 docs=791
+       fingerprint=8043133984068228136
+```
+
+The run stopped after 197 of 256 requests. The cause was iteration over
+`input_batch.req_id_to_index`, whose insertion order is not a TP protocol:
+request addition, removal, slot swapping, and batch compaction can give ranks
+the same request set with different dictionary histories. The vLLM adapter now
+sorts active request-ID/index pairs and finished request IDs before ingestion.
+The two parts of the fix therefore have separate responsibilities:
+
+1. Canonical request-ID ordering guarantees **what** is rebuilt.
+2. The CPU collective and explicit epoch commit guarantee **when** it becomes
+   active.
+
+After both changes, c=64, c=128, and repeated rebuild runs no longer reproduced
+the mismatch or a collective hang. The fingerprint intentionally covers the
+ordered document-length layout without copying token content to the host. It
+detects this class of layout divergence without a device synchronization and
+relies on vLLM TP to replicate the actual request tokens. A future executor that
+does not replicate ingestion must broadcast the rebuild command/snapshot before
+using a pending-only collective; otherwise a conditional collective could
+deadlock if only some ranks launch a rebuild.
 
 ### Code boundaries
 
@@ -180,7 +207,8 @@ deadlock if only some ranks launched a rebuild.
 - `suffix_gpu/proposer.py`: exposes rebuild state and commit without depending
   on vLLM or any distributed package.
 - vLLM `v1/spec_decode/suffix_proposer_gpu.py`: owns the TP Gloo collective and
-  validates all rank records. No vLLM distributed-core change is required.
+  validates all rank records, and canonicalizes request ingestion order. No
+  vLLM distributed-core change is required.
 
 Single-GPU and standalone users retain the old automatic local poll behavior;
 vLLM enables coordinated mode only when tensor parallel size is greater than
@@ -213,6 +241,40 @@ the old index remains active. Nsight Systems was used to confirm the rebuild
 kernel/event timeline; CUDA API tracing perturbs enqueue latency, so serving
 throughput was measured without profiler instrumentation.
 
+An additional Nsight Systems capture was taken around the complete vLLM TP2
+server, not a synthetic rebuild loop. The c=64 run completed 256/256 requests at
+1445.21 output tok/s while profiled and naturally rebuilt twice. The suffix
+rebuild work was identified on the dedicated side stream by CCCL radix-sort,
+scan, and unique kernels:
+
+| Natural rebuild | Rank launch/start skew | Rank completion skew |
+| ---: | ---: | ---: |
+| 1 | 0.225 ms | 0.818 ms |
+| 2 | 0.243 ms | 1.751 ms |
+
+No state mismatch, engine failure, or hang occurred. These Nsight-instrumented
+skews are larger than the earlier unprofiled measurements and demonstrate a
+real interval in which one rank is ready while the other is not. The old-SA
+policy covers that interval without waiting for either GPU.
+
+The actual six-`int64` TP Gloo all-gather was also profiled in isolation. After
+its initialization call, observed host durations were 0.34-1.35 ms under
+Nsight. An earlier unprofiled one-value collective microbenchmark measured
+196.5 us p50, but it is only a latency reference, not the same operation. The
+vLLM trace has no dedicated NVTX range around `_poll_rebuild`, so general vLLM
+CUDA synchronization calls in the report must not be attributed to this fix;
+the consistency path itself calls neither `cudaEventSynchronize` nor
+`torch.cuda.synchronize`.
+
+Artifacts:
+
+```text
+/data/zip/AIInfra/benchmarks/results/pr52097_exact_tp_matrix_clean_20260913/
+  tp2_rebuild_collective.nsys-rep
+  actual_vllm_profile/vllm_tp2_suffixgpu_c64.nsys-rep
+  actual_vllm_profile/vllm_tp2_suffixgpu_c64.stats.txt
+```
+
 ### Recommended configuration from the Qwen3-8B sweep
 
 The best tested TP2 configuration was:
@@ -241,26 +303,47 @@ The factor sweep at c=64/c=128 measured `1562/1678 tok/s` for factor 0.5,
 was the strongest tested setting; `min_token_prob=0.1` remained marginally
 ahead of 0.2 and 0.3.
 
-### Fixed-branch serving result
+### Qwen3-8B TP1/TP2/TP4 throughput matrix
 
-With the recommended defaults and coordinated poll enabled, Qwen3-8B TP2
-completed a 64-request warmup followed by 256 Spec-Bench requests at c=64:
+The fixed branch was tested at c=1/4/8/32/64/128/256 with Spec-Bench. All
+methods used Qwen3-8B, `max_model_len=16384`, `max_num_batched_tokens=8192`,
+`max_num_seqs=320`, GPU memory utilization 0.9, and prefix caching disabled.
+SuffixGPU used async scheduling and the recommended `k=5`, factor 0.5,
+min-probability 0.1, 128 occurrences, backoff 8, cache 1000, and tree depth 24.
+NgramGPU and AsyncNoSpec also used async scheduling; SuffixCPU used synchronous
+scheduling. Values below are output tokens/s:
 
-| Result | Value |
-| --- | ---: |
-| Completed / failed | 256 / 0 |
-| Output throughput | 1382.1 tok/s |
-| Total-token throughput | 2911.5 tok/s |
-| Mean TPOT | 41.42 ms |
-| Mean TTFT | 688.50 ms |
+| TP | Method | c1 | c4 | c8 | c32 | c64 | c128 |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | NgramGPU | 60.0 | 224.6 | 416.1 | 1174.7 | 1488.6 | 1430.2 |
+| 1 | SuffixCPU | 79.7 | 501.2 | 985.4 | 2375.8 | 2268.1 | 2258.8 |
+| 1 | AsyncNoSpec | 59.5 | 223.3 | 428.4 | 1295.8 | 1446.8 | 1467.6 |
+| 1 | SuffixGPU | 75.6 | 436.6 | 834.8 | 2182.9 | 2509.5 | 2416.0 |
+| 2 | NgramGPU | 85.6 | 299.0 | 480.4 | 1083.4 | 1428.4 | 1661.4 |
+| 2 | SuffixCPU | 111.9 | 574.2 | 971.6 | 1725.3 | 1848.2 | 1975.1 |
+| 2 | AsyncNoSpec | 99.7 | 333.7 | 580.1 | 1246.4 | 1689.2 | 2007.2 |
+| 2 | SuffixGPU | 106.3 | 503.5 | 854.1 | 1625.3 | 1849.7 | 2005.3 |
+| 4 | NgramGPU | 99.5 | 338.0 | 576.1 | 1081.8 | 1397.0 | 1545.7 |
+| 4 | SuffixCPU | 145.7 | 663.2 | 954.1 | 1591.0 | 1690.8 | 1731.6 |
+| 4 | AsyncNoSpec | 145.2 | 464.9 | 756.6 | 1341.5 | 1678.7 | 1931.6 |
+| 4 | SuffixGPU | 134.5 | 602.8 | 891.2 | 1534.0 | 1704.3 | 1771.3 |
 
-The same-size earlier run with the old poll and old factor-1.0 configuration
-measured `1264.5 tok/s` and `45.30 ms` mean TPOT. This is not a clean estimate
-of collective overhead because the configuration changed at the same time;
-the improvement is primarily consistent with the factor sweep. Correctness is
-the meaningful result: all 256 requests completed, multiple default-threshold
-rebuilds occurred, and the TP collective neither hung nor reported an
-epoch/snapshot mismatch.
+82 of 84 formal cells completed successfully. TP2 and TP4 SuffixGPU at c=256
+failed in the rejection sampler when `target_logits.clone()` requested an
+additional 656 MiB. This is a peak-memory limit, not a rebuild-consistency
+failure; partial client throughput from those runs is deliberately excluded.
+TP1 required `max_model_len=16384` because the larger attempted context did not
+leave enough KV-cache capacity to start. Methods were run concurrently on
+disjoint GPU sets to use all eight GPUs, so this is a practical scaling snapshot
+with possible shared CPU/host contention, not a strict low-noise pairwise A/B.
+
+Across every valid SuffixGPU cell, including all TP2/TP4 rebuild activity, no
+epoch/layout mismatch, commit error, or collective hang was observed. The raw
+JSON, server logs, and completion markers are under:
+
+```text
+/data/zip/AIInfra/benchmarks/results/pr52097_exact_tp_matrix_clean_20260913
+```
 
 ## How it works
 
