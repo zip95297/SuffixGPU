@@ -418,8 +418,9 @@ torch 2.13, batch = whole category (58–80 requests), k=16:
   B≈64–128; at B=128/256/512 the GPU graph path is **2.2× / 2.7× / 2.1×
   faster** than the CPU speculate loop — and it never syncs to the host,
   so it composes with async scheduling and CUDA graphs.
-- **Memory**: ≤ 532 MB reserved VRAM at B=256, S=16384, 4M-token corpus
-  (persistent drafter state 96 MB; no extra CUDA-graph pool retention).
+- **Memory**: dedicated pool sharing plus largest-first capture cuts retained
+  multi-bucket graph memory by 57% in the largest standalone case and by 63%
+  with the vLLM PR defaults, without removing any batch bucket.
 
 - **Drafter-level knob sweep:** full B/occ/backoff CPU/eager/graph timing tables are moved to the end of this README to keep the main benchmark section compact.
 
