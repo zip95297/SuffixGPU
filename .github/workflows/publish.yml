@@ -1,0 +1,51 @@
+# Publishes suffix-gpu to PyPI via OIDC trusted publishing — no API
+# token stored anywhere.
+#
+# One-time setup (already done, 2026-08-11): PyPI → project suffix-gpu
+# → Settings → Publishing → GitHub publisher with
+#   repository zip95297/SuffixGPU, workflow publish.yml, environment pypi.
+# The GitHub-side "pypi" environment is created automatically on first
+# run; optionally add required reviewers to it for release approval.
+#
+# Branching model: `publish` is the release (and GitHub default)
+# branch and carries the packaging metadata (pyproject, LICENSE, this
+# workflow); `main` is the development branch.
+#
+# To release:
+#   1. git checkout publish && git merge main      # pull in dev work
+#   2. bump __version__ in suffix_gpu/__init__.py (single version source)
+#   3. git tag vX.Y.Z && git push origin publish vX.Y.Z
+# The tagged commit must contain this file (always true when tagging on
+# publish); the tag must be a new version — PyPI rejects re-uploads.
+name: Publish to PyPI
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/suffix-gpu
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
