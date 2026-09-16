@@ -23,6 +23,7 @@ Design (phase 2):
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass
 
 import torch
 
@@ -38,6 +39,16 @@ PAD_TOKEN = torch.iinfo(torch.int32).max
 SEP_TOKEN = -2
 
 
+@dataclass(frozen=True)
+class RebuildState:
+    """Host-visible state used by an external multi-rank coordinator."""
+
+    active_epoch: int
+    pending_epoch: int | None
+    ready: bool
+    snapshot_signature: tuple[int, int, int] | None
+
+
 class GlobalIndex:
     """GPU-resident global suffix index with periodic rebuilds."""
 
@@ -50,6 +61,7 @@ class GlobalIndex:
         rebuild_threshold: int | None = None,
         device: torch.device | str = "cpu",
         rebuild_stream: torch.cuda.Stream | None = None,
+        coordinated_rebuild: bool = False,
     ):
         self.capacity = capacity
         self.delta_capacity = delta_capacity
@@ -59,6 +71,7 @@ class GlobalIndex:
             1, delta_capacity // 2)
         self.device = torch.device(device)
         self.rebuild_stream = rebuild_stream
+        self.coordinated_rebuild = coordinated_rebuild
 
         self.corpus = torch.full((capacity,), PAD_TOKEN, dtype=torch.int32,
                                  device=self.device)
@@ -79,6 +92,9 @@ class GlobalIndex:
         self.delta_doc_lens: list[int] = []
         self._rebuild_event: torch.cuda.Event | None = None
         self._pending: tuple[int, deque[int]] | None = None
+        self.active_epoch = 0
+        self.pending_epoch: int | None = None
+        self._pending_signature: tuple[int, int, int] | None = None
 
     # ------------------------------------------------------------------
     # writes
@@ -201,6 +217,8 @@ class GlobalIndex:
         # Build over the real prefix plus one sentinel column so the
         # build-time suffix order matches query-time comparisons.
         m = min(n_new + 1, self.capacity)
+        next_epoch = self.active_epoch + 1
+        signature = self._snapshot_signature(n_new, new_doc_lens)
         if self.device.type == "cuda" and self.rebuild_stream is not None:
             self.rebuild_stream.wait_stream(
                 torch.cuda.current_stream(self.device))
@@ -210,9 +228,11 @@ class GlobalIndex:
             event.record(self.rebuild_stream)
             self._pending = (n_new, new_doc_lens)
             self._rebuild_event = event
+            self.pending_epoch = next_epoch
+            self._pending_signature = signature
         else:
             self._build_staging_sa(dst, m)
-            self._finish_swap(n_new, new_doc_lens)
+            self._finish_swap(n_new, new_doc_lens, next_epoch)
 
     def _build_staging_sa(self, dst: torch.Tensor, m: int) -> None:
         self.staging_sa[:m] = build_suffix_array(dst[:m]).to(torch.int32)
@@ -232,7 +252,22 @@ class GlobalIndex:
             count += 1
         return count
 
-    def _finish_swap(self, n_new: int, new_doc_lens: deque[int]) -> None:
+    @staticmethod
+    def _snapshot_signature(
+        n_new: int,
+        doc_lens: deque[int],
+    ) -> tuple[int, int, int]:
+        fingerprint = 0
+        for length in doc_lens:
+            fingerprint = (fingerprint * 1000003 + length) & ((1 << 63) - 1)
+        return n_new, len(doc_lens), fingerprint
+
+    def _finish_swap(
+        self,
+        n_new: int,
+        new_doc_lens: deque[int],
+        epoch: int,
+    ) -> None:
         # In-place copy instead of a reference swap: captured CUDA
         # graphs (and compiled propose paths) bind the active tensors'
         # storage, so the active buffers must keep their identity.
@@ -240,16 +275,44 @@ class GlobalIndex:
         self.sa.copy_(self.staging_sa)
         self.active_len = n_new
         self.active_doc_lens = new_doc_lens
+        self.active_epoch = epoch
         self._rebuild_event = None
         self._pending = None
+        self.pending_epoch = None
+        self._pending_signature = None
 
-    def poll_rebuild(self) -> None:
+    def rebuild_state(self) -> RebuildState:
+        """Return local rebuild state without waiting for CUDA work."""
+        ready = (self._rebuild_event is not None
+                 and self._rebuild_event.query())
+        return RebuildState(
+            active_epoch=self.active_epoch,
+            pending_epoch=self.pending_epoch,
+            ready=ready,
+            snapshot_signature=self._pending_signature,
+        )
+
+    def commit_rebuild(self, epoch: int) -> None:
+        """Commit a locally ready epoch after external rank consensus."""
+        if self.pending_epoch != epoch or self._pending is None:
+            raise RuntimeError(
+                f"cannot commit epoch {epoch}; pending={self.pending_epoch}")
+        if self._rebuild_event is None or not self._rebuild_event.query():
+            raise RuntimeError(f"cannot commit epoch {epoch}; rebuild not ready")
+        n_new, new_doc_lens = self._pending
+        self._finish_swap(n_new, new_doc_lens, epoch)
+
+    def poll_rebuild(self) -> bool:
         """Swap in a finished background rebuild (non-blocking)."""
         if self._rebuild_event is None:
-            return
+            return False
+        if self.coordinated_rebuild:
+            return False
         if self._rebuild_event.query():
-            n_new, new_doc_lens = self._pending
-            self._finish_swap(n_new, new_doc_lens)
+            assert self.pending_epoch is not None
+            self.commit_rebuild(self.pending_epoch)
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # queries
