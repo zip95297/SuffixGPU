@@ -28,9 +28,9 @@ Run date: 2026-08-11, repo at commit `c21ff49` plus
    microseconds — the GPU path's value there is architectural: no
    per-step host sync, so it composes with async scheduling and CUDA
    graphs, which the CPU path structurally cannot.
-4. **VRAM cost is bounded**: ≤ 532 MB reserved in the largest tested
-   configuration (B=256, S=16384, 4M-token corpus), zero extra
-   CUDA-graph pool (§5).
+4. **CUDA-graph pooling matters**: largest-first capture into a shared pool
+   cuts retained graph memory by 57% in the largest standalone multi-bucket
+   configuration (804 MB → 346 MB), without removing a bucket (§5).
 
 ## Environment
 
@@ -201,18 +201,25 @@ is already faster from B≈32.
 
 ## 5. GPU memory (`bench_memory.py`)
 
-The arctic baseline keeps its suffix tree in host RAM (0 B of VRAM);
-this table is SuffixGPU's total device-side cost, k=16, depth=24.
+The arctic baseline keeps its suffix tree in host RAM (0 B of VRAM). The
+following RTX 4090 measurements use k=16 and depth=24. Graph columns report
+physical memory retained after synchronizing and emptying the allocator cache;
+this catches graph-private pool memory that `torch.cuda.memory_allocated()`
+does not expose.
 
-| B | S | Corpus cap | Persistent drafter | Token buffer [B,S] | Propose peak (eager, transient) | Graph pool extra | Total reserved |
-| ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
-| 32 | 4 096 | 2^20 | 24.1 MB | 0.5 MB | 13.2 MB | 0.0 MB | 66 MB |
-| 128 | 16 384 | 2^20 | 24.1 MB | 8.0 MB | 52.2 MB | 0.0 MB | 154 MB |
-| 256 | 16 384 | 2^22 | 96.3 MB | 16.0 MB | 208.4 MB | 0.0 MB | 532 MB |
+| B | S | Corpus cap | Persistent drafter | Token buffer | Eager peak | Single graph | Multi independent, ascending | Multi shared, ascending | Multi shared, descending |
+| ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | 4 096 | 2^20 | 16.1 MB | 0.5 MB | 12.7 MB | 48 MB | 148 MB | 48 MB | 48 MB |
+| 128 | 16 384 | 2^20 | 16.1 MB | 8.0 MB | 58.3 MB | 134 MB | 366 MB | 142 MB | 138 MB |
+| 256 | 16 384 | 2^22 | 64.3 MB | 16.0 MB | 192.4 MB | 340 MB | 804 MB | 506 MB | 346 MB |
 
-Even the largest configuration (B=256, 16K contexts, 4M-token global
-corpus) stays around half a GB of allocator-reserved VRAM; CUDA-graph
-capture retains no extra pool memory beyond the eager working set.
+The vLLM integration uses one graph for every power-of-two batch bucket plus
+`max_num_seqs`. Sharing a dedicated pool preserves those buckets, while
+largest-first capture lets smaller graphs reuse the largest graph's working
+storage. With the PR defaults (B=320, S=16384, k=5, 4M-token corpus), retained
+graph memory fell from 1,044 MB to 382 MB (63%) on the same RTX 4090. This is
+an integration measurement and is intentionally separate from the standalone
+k=16 table above.
 
 ## Reproduce
 
