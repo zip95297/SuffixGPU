@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from suffix_gpu.proposer import SuffixGPUDrafter
@@ -40,6 +41,48 @@ def test_update_state_clips_at_buffer_end(device):
     new_counts = d.update_state(counts, buf, sampled)
     assert buf[0].tolist()[3] == 5  # first fits
     assert new_counts.tolist() == [5]  # count still advances
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_stage_graph_update_matches_update_state():
+    device = torch.device("cuda")
+    d = _drafter(device)
+    bucket = 4
+    real_batch = 3
+    original = torch.zeros(bucket, 16, dtype=torch.int32, device=device)
+    original[0, :3] = torch.tensor([1, 2, 3], device=device)
+    original[1, :5] = 9
+    original[2, :2] = torch.tensor([4, 5], device=device)
+    base = torch.tensor([3, 5, 2], dtype=torch.int32, device=device)
+    sampled = torch.tensor(
+        [[7, 8, -1], [4, -1, -1], [-1, -1, -1]],
+        dtype=torch.int32,
+        device=device,
+    )
+    count = torch.tensor([2, 1, 0], dtype=torch.int32, device=device)
+
+    expected = original.clone()
+    expected_count = d.update_state(base, expected[:real_batch], sampled, count)
+    actual = original.clone()
+    staged_count = torch.full(
+        (bucket,), 123, dtype=torch.int32, device=device)
+    staged_mask = torch.ones(bucket, dtype=torch.bool, device=device)
+    d.stage_graph_update(
+        base,
+        actual,
+        sampled,
+        count,
+        staged_count,
+        staged_mask,
+        real_batch,
+        max_model_len=16,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual, expected)
+    assert torch.equal(staged_count[:real_batch], expected_count)
+    assert staged_count[real_batch:].tolist() == [0]
+    assert staged_mask.tolist() == [True, True, False, False]
 
 
 def test_propose_with_update_drafts_repetition(device):

@@ -54,6 +54,62 @@ if HAS_TRITON:
         tl.store(out_ptr + b * n_out + i, mb, mask=m_i)
 
     @triton.jit
+    def _match_back_support_kernel(src_ptr, pat_ptr, qlen_ptr, out_ptr,
+                                   support_ptr, row_stride, n_out,
+                                   P: tl.constexpr, BLOCK: tl.constexpr):
+        b = tl.program_id(0)
+        i = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        q_len = tl.load(qlen_ptr + b).to(tl.int32)
+        m_i = (i < n_out) & (i < q_len)
+        base = src_ptr + b * row_stride
+        acc = tl.full((BLOCK,), True, tl.int1)
+        mb = tl.zeros((BLOCK,), dtype=tl.int32)
+        for t in tl.static_range(P):
+            pat_t = tl.load(pat_ptr + b * P + t)
+            idx = i - 1 - t
+            tok = tl.load(base + idx, mask=m_i & (idx >= 0), other=-1)
+            acc = acc & (tok == pat_t)
+            mb += acc.to(tl.int32)
+        mb = tl.where(m_i, mb, 0)
+        tl.store(out_ptr + b * n_out + i, mb.to(tl.uint8), mask=i < n_out)
+        for length in tl.static_range(1, P + 1):
+            count = tl.sum((m_i & (mb >= length)).to(tl.int32), axis=0)
+            tl.atomic_add(support_ptr + b * (P + 1) + length, count)
+
+    @triton.jit
+    def _select_support_candidates_kernel(support_ptr, threshold_ptr,
+                                          mask_ptr, out_ptr,
+                                          P: tl.constexpr,
+                                          PP: tl.constexpr,
+                                          C: tl.constexpr,
+                                          MIN_MATCH: tl.constexpr):
+        row = tl.program_id(0)
+        b = row // C
+        c = row % C
+        length = tl.arange(0, PP)
+        support = tl.load(
+            support_ptr + b * (P + 1) + length,
+            mask=length <= P,
+            other=0,
+        )
+        threshold = tl.load(threshold_ptr + c)
+        valid = (length >= MIN_MATCH) & (length <= P)
+        candidate = tl.max(
+            tl.where(valid & (support >= threshold), length, 0), axis=0
+        )
+        enabled = tl.load(mask_ptr + b)
+        candidate = tl.where(enabled, candidate, 0)
+        previous_threshold = tl.load(
+            threshold_ptr + c - 1, mask=c > 0, other=0)
+        previous = tl.max(
+            tl.where(valid & (support >= previous_threshold), length, 0),
+            axis=0,
+        )
+        duplicate = (c > 0) & (candidate == previous)
+        candidate = tl.where(duplicate, 0, candidate)
+        tl.store(out_ptr + row, candidate)
+
+    @triton.jit
     def _sa_search_kernel(sa_ptr, corpus_ptr, pat_ptr, plen_ptr, out_ptr,
                           n_corpus, n_rows, M: tl.constexpr,
                           ITERS: tl.constexpr, BLOCK: tl.constexpr):
@@ -243,6 +299,44 @@ if HAS_TRITON:
         tl.store(cnt_ptr + row, found)
 
     @triton.jit
+    def _occurrence_continuation_kernel(mb_ptr, thr_ptr, token_ptr,
+                                        qlen_ptr, cont_ptr, cnt_ptr,
+                                        n_cols, row_stride,
+                                        C: tl.constexpr, R: tl.constexpr,
+                                        K: tl.constexpr, RP: tl.constexpr,
+                                        BLOCK: tl.constexpr):
+        row = tl.program_id(0)
+        b = row // C
+        threshold = tl.load(thr_ptr + row).to(tl.int32)
+        q_len = tl.load(qlen_ptr + b).to(tl.int32)
+        found = tl.zeros((), dtype=tl.int32)
+        off = tl.where(threshold > 0, 0, n_cols).to(tl.int32)
+        while (off < n_cols) & (found < R):
+            idx = off + tl.arange(0, BLOCK)
+            value = tl.load(mb_ptr + b * n_cols + idx,
+                            mask=idx < n_cols, other=0).to(tl.int32)
+            hit = (idx < q_len) & (value >= threshold)
+            cumulative = tl.cumsum(hit.to(tl.int32), axis=0)
+            slot = found + cumulative - 1
+            keep = hit & (slot < R)
+            for depth in tl.static_range(K):
+                token_idx = idx + depth
+                token = tl.load(token_ptr + b * row_stride + token_idx,
+                                mask=keep & (token_idx < q_len), other=-1)
+                tl.store(
+                    cont_ptr + (row * R + slot) * K + depth,
+                    token,
+                    mask=keep,
+                )
+            found = tl.minimum(found + tl.sum(hit.to(tl.int32), axis=0), R)
+            off += BLOCK
+        rr = tl.arange(0, RP)
+        for depth in tl.static_range(K):
+            tl.store(cont_ptr + (row * R + rr) * K + depth, -1,
+                     mask=(rr >= found) & (rr < R))
+        tl.store(cnt_ptr + row, found)
+
+    @triton.jit
     def _scatter_append_kernel(tok_ptr, base_ptr, cnt_ptr, samp_ptr,
                                s_len, T: tl.constexpr,
                                TP: tl.constexpr):
@@ -254,6 +348,27 @@ if HAS_TRITON:
         pos = base + j
         ok = (j < T) & (j < cnt) & (val != -1) & (pos < s_len)
         tl.store(tok_ptr + b * s_len + pos, val, mask=ok)
+
+    @triton.jit
+    def _stage_graph_update_kernel(tok_ptr, base_ptr, cnt_ptr, samp_ptr,
+                                   out_count_ptr, out_mask_ptr, real_batch,
+                                   s_len, model_limit, T: tl.constexpr,
+                                   TP: tl.constexpr):
+        b = tl.program_id(0)
+        active = b < real_batch
+        base = tl.load(base_ptr + b, mask=active, other=0).to(tl.int32)
+        cnt = tl.load(cnt_ptr + b, mask=active, other=0).to(tl.int32)
+        j = tl.arange(0, TP)
+        val = tl.load(samp_ptr + b * T + j,
+                      mask=active & (j < T), other=-1)
+        pos = base + j
+        write = (active & (j < T) & (j < cnt) & (val != -1)
+                 & (pos < s_len))
+        tl.store(tok_ptr + b * s_len + pos, val, mask=write)
+        new_count = base + cnt
+        tl.store(out_count_ptr + b, tl.where(active, new_count, 0))
+        eligible = active & (cnt > 0) & (new_count < model_limit)
+        tl.store(out_mask_ptr + b, eligible)
 
 
 def match_back(src: torch.Tensor, pat: torch.Tensor,
@@ -278,6 +393,53 @@ def match_back(src: torch.Tensor, pat: torch.Tensor,
     grid = (b, triton.cdiv(n_out, block))
     _match_back_kernel[grid](src, pat, out, row_stride, n_out,
                              P=p, BLOCK=block)
+    return out
+
+
+def match_back_support(
+    src: torch.Tensor,
+    pat: torch.Tensor,
+    q_len: torch.Tensor,
+    n_out: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute compact match lengths and cumulative support counts."""
+    b, p = pat.shape
+    src = src.contiguous()
+    pat = pat.contiguous()
+    q_len = q_len.contiguous()
+    out = torch.empty(b, n_out, dtype=torch.uint8, device=src.device)
+    support = torch.zeros(b, p + 1, dtype=torch.int32, device=src.device)
+    row_stride = src.stride(0) if src.dim() == 2 else 0
+    block = 256
+    grid = (b, triton.cdiv(n_out, block))
+    _match_back_support_kernel[grid](
+        src, pat, q_len, out, support, row_stride, n_out, P=p, BLOCK=block
+    )
+    return out, support
+
+
+def select_support_candidates(
+    support: torch.Tensor,
+    thresholds: torch.Tensor,
+    combined_mask: torch.Tensor,
+    min_match_len: int,
+) -> torch.Tensor:
+    """Select and deduplicate candidate lengths from cumulative support."""
+    b, p1 = support.shape
+    p = p1 - 1
+    c = thresholds.numel()
+    pp = max(triton.next_power_of_2(p + 1), 2)
+    out = torch.empty(b, c, dtype=torch.int64, device=support.device)
+    _select_support_candidates_kernel[(b * c,)](
+        support,
+        thresholds,
+        combined_mask,
+        out,
+        P=p,
+        PP=pp,
+        C=c,
+        MIN_MATCH=min_match_len,
+    )
     return out
 
 
@@ -389,6 +551,40 @@ def first_occurrences(mb: torch.Tensor, thr: torch.Tensor, c: int,
     return out.to(torch.int64), cnt.to(torch.int64)
 
 
+def occurrence_continuations(
+    mb: torch.Tensor,
+    candidates: torch.Tensor,
+    token_ids: torch.Tensor,
+    q_len: torch.Tensor,
+    r: int,
+    k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Collect earliest occurrences and gather continuations directly."""
+    b, c = candidates.shape
+    n = mb.shape[1]
+    s = token_ids.shape[1]
+    cont = torch.empty(b, c, r, k, dtype=token_ids.dtype,
+                       device=token_ids.device)
+    count = torch.empty(b, c, dtype=torch.int64, device=token_ids.device)
+    rp = max(triton.next_power_of_2(r), 2)
+    _occurrence_continuation_kernel[(b * c,)](
+        mb,
+        candidates,
+        token_ids,
+        q_len,
+        cont,
+        count,
+        n,
+        s,
+        C=c,
+        R=r,
+        K=k,
+        RP=rp,
+        BLOCK=1024,
+    )
+    return cont, count
+
+
 def scatter_append(token_ids_gpu: torch.Tensor, base: torch.Tensor,
                    cnt: torch.Tensor,
                    sampled: torch.Tensor) -> None:
@@ -400,3 +596,27 @@ def scatter_append(token_ids_gpu: torch.Tensor, base: torch.Tensor,
         token_ids_gpu, base.to(torch.int64).contiguous(),
         cnt.to(torch.int64).contiguous(),
         sampled.to(token_ids_gpu.dtype).contiguous(), s, T=t, TP=tp)
+
+
+def stage_graph_update(
+    token_ids_gpu: torch.Tensor,
+    base: torch.Tensor,
+    cnt: torch.Tensor,
+    sampled: torch.Tensor,
+    out_counts: torch.Tensor,
+    out_mask: torch.Tensor,
+    real_batch: int,
+    model_limit: int,
+) -> None:
+    """Stage graph inputs and append sampled tokens in one launch.
+
+    The destination tensors have the graph bucket width. Rows at or beyond
+    ``real_batch`` are reset so a larger captured graph can safely serve a
+    smaller runtime batch.
+    """
+    bucket, s = token_ids_gpu.shape
+    t = sampled.shape[1]
+    tp = max(triton.next_power_of_2(t), 2)
+    _stage_graph_update_kernel[(bucket,)](
+        token_ids_gpu, base, cnt, sampled, out_counts, out_mask,
+        real_batch, s, model_limit, T=t, TP=tp)

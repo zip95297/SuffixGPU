@@ -109,6 +109,52 @@ when you manage state updates yourself.
 | `min_token_prob` | `0.0` | Cumulative-probability cutoff during expansion |
 | `num_backoff` | `8` | Candidate match lengths per path: local support thresholds `2^0..2^(C-1)`, global capped lengths halving from `max_pattern_len` (plus a final 2; distinct caps saturate at ~log2 of the pattern length). `1` = longest match only; larger values probe more lengths at small marginal cost |
 
+## Paired vLLM performance branch
+
+The low-concurrency and CUDA-graph optimizations on this development branch
+span two repositories and must be tested together:
+
+- SuffixGPU: [`zip95297/SuffixGPU`, branch
+  `perf/phase2-low-concurrency`](https://github.com/zip95297/SuffixGPU/tree/perf/phase2-low-concurrency)
+- vLLM integration: [`zip95297/vllm-dev`, branch
+  `perf/phase2-low-concurrency`](https://github.com/zip95297/vllm-dev/tree/perf/phase2-low-concurrency)
+
+This repository owns the device-side implementation:
+
+- one Triton launch stages graph inputs, appends accepted tokens, updates
+  sequence lengths, and clears padded graph-bucket rows;
+- match-back and support counting are fused, with compact match-length
+  storage;
+- candidate selection/deduplication and occurrence-continuation gathering use
+  dedicated fused kernels;
+- local history scans accept a safe `scan_limit` instead of always reading the
+  complete model-length buffer;
+- batches up to 64 use the fused local path, while larger batches retain the
+  measured-faster legacy path;
+- CPU/PyTorch fallbacks and fused-versus-legacy equivalence tests remain in
+  place.
+
+The paired vLLM branch owns the runtime policy: it computes a synchronization-
+free scan upper bound from host metadata, selects `(batch, scan)` CUDA-graph
+buckets, stages dynamic inputs before replay, and captures all Suffix graphs in
+one independent shared memory pool. The pool is shared only among serial
+Suffix graph replays, not with vLLM model graphs.
+
+On Qwen3-8B with `k=5`, the fused local matcher reduced the measured GPU-op
+count from 70--90 to 36 per call and was about 1.8--2.0x faster in an isolated
+Nsight profile. End-to-end C1 throughput stayed within roughly one percent of
+the baseline, while TP1 c64/c128 improved by about 4.1%/3.5%. The most concrete
+system-level gain was TP4 c256 stability: the private-pool baseline ran out of
+memory, while the paired branches completed three consecutive runs. Acceptance
+rate showed no directional regression, and fused/legacy outputs were checked
+tensor-for-tensor.
+
+The fused match-length buffer is `uint8`; the tested and recommended pattern
+length is 24 (and must remain at most 255 unless the storage type or fallback
+policy is changed). The scan bound relies on vLLM's host sequence-length
+metadata matching device state; the paired adapter adds the full sampled-token
+width conservatively and rounds up to the next scan bucket.
+
 ## Multi-TP rebuild consistency
 
 The complete benchmark and profile record is in

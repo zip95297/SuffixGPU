@@ -100,6 +100,52 @@ def test_proposer_contract(device):
     assert draft[0].tolist()[:nv[0].item()] == exp_chain
 
 
+@pytest.mark.parametrize("scan_limit", [16, 32, 64])
+def test_scan_limit_matches_full_buffer(device, scan_limit):
+    kernel = LocalMatchKernel(k=K, max_pattern_len=MAX_P, max_occurrences=R)
+    seqs = [
+        [1, 2, 3, 4] * 3,
+        [7, 8, 7, 8, 7, 8],
+    ]
+    width = 64
+    buf = torch.zeros(len(seqs), width, dtype=torch.int32, device=device)
+    lens = torch.tensor([len(s) for s in seqs], dtype=torch.int32, device=device)
+    for i, seq in enumerate(seqs):
+        buf[i, :len(seq)] = torch.tensor(seq, dtype=torch.int32, device=device)
+    mask = torch.ones(len(seqs), dtype=torch.bool, device=device)
+
+    expected = kernel(lens, buf, mask)
+    actual = kernel(lens, buf, mask, scan_limit=scan_limit)
+    for got, want in zip(actual, expected):
+        assert torch.equal(got, want)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_fused_local_matches_legacy_random():
+    device = torch.device("cuda")
+    fused = LocalMatchKernel(
+        k=K, max_pattern_len=6, max_occurrences=8, fused_local=True)
+    legacy = LocalMatchKernel(
+        k=K, max_pattern_len=6, max_occurrences=8, fused_local=False)
+    generator = torch.Generator().manual_seed(7)
+    seqs = []
+    for _ in range(16):
+        length = int(torch.randint(8, 64, (1,), generator=generator))
+        seqs.append(torch.randint(0, 8, (length,), generator=generator).tolist())
+    width = 128
+    buf = torch.zeros(len(seqs), width, dtype=torch.int32, device=device)
+    lens = torch.tensor([len(seq) for seq in seqs], dtype=torch.int32,
+                        device=device)
+    for row, seq in enumerate(seqs):
+        buf[row, :len(seq)] = torch.tensor(seq, dtype=torch.int32,
+                                           device=device)
+    mask = torch.ones(len(seqs), dtype=torch.bool, device=device)
+    expected = legacy(lens, buf, mask, scan_limit=128)
+    actual = fused(lens, buf, mask, scan_limit=128)
+    for got, want in zip(actual, expected):
+        assert torch.equal(got, want)
+
+
 @pytest.mark.parametrize("compile_fn", [torch.compile], ids=["compiled"])
 def test_local_match_torch_compile_cpu(compile_fn):
     kernel = LocalMatchKernel(k=K, max_pattern_len=4, max_occurrences=8)

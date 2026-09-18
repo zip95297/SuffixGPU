@@ -49,6 +49,8 @@ class SuffixGPUDrafter:
         vote_smoothing_alpha: float = 0.0,
         parallel_paths: bool = True,
         coordinated_rebuild: bool = False,
+        fused_local: bool = True,
+        fused_local_max_batch: int = 64,
     ):
         self.k = k
         self.device = torch.device(device)
@@ -94,6 +96,8 @@ class SuffixGPUDrafter:
             max_spec_offset=max_spec_offset,
             support_thresholds=support_thresholds,
             vote_smoothing_alpha=self.vote_smoothing_alpha,
+            fused_local=fused_local,
+            fused_local_max_batch=fused_local_max_batch,
         ).to(self.device)
         self.global_index: GlobalIndex | None = None
         self._ingested: dict = {}
@@ -198,6 +202,45 @@ class SuffixGPUDrafter:
             token_ids_gpu.scatter_(1, pos_j, val_j)
         return (base + cnt).to(torch.int32)
 
+    def stage_graph_update(
+        self,
+        num_tokens_no_spec: torch.Tensor,
+        token_ids_gpu: torch.Tensor,
+        sampled_token_ids: torch.Tensor,
+        valid_sampled_tokens_count: torch.Tensor,
+        out_num_tokens: torch.Tensor,
+        out_combined_mask: torch.Tensor,
+        real_batch: int,
+        max_model_len: int | None = None,
+    ) -> None:
+        """Prepare fixed graph inputs and update token state in one launch."""
+        limit = token_ids_gpu.shape[1] if max_model_len is None else min(
+            max_model_len, token_ids_gpu.shape[1])
+        if triton_kernels.available(token_ids_gpu, sampled_token_ids):
+            triton_kernels.stage_graph_update(
+                token_ids_gpu,
+                num_tokens_no_spec,
+                valid_sampled_tokens_count,
+                sampled_token_ids,
+                out_num_tokens,
+                out_combined_mask,
+                real_batch,
+                limit,
+            )
+            return
+
+        out_num_tokens.zero_()
+        out_combined_mask.zero_()
+        updated = self.update_state(
+            num_tokens_no_spec[:real_batch],
+            token_ids_gpu[:real_batch],
+            sampled_token_ids[:real_batch],
+            valid_sampled_tokens_count[:real_batch],
+        )
+        out_num_tokens[:real_batch].copy_(updated)
+        out_combined_mask[:real_batch].copy_(
+            (valid_sampled_tokens_count[:real_batch] > 0) & (updated < limit))
+
     def propose_with_update(
         self,
         num_tokens_no_spec: torch.Tensor,
@@ -233,6 +276,7 @@ class SuffixGPUDrafter:
         num_tokens_no_spec: torch.Tensor,
         token_ids_gpu: torch.Tensor,
         combined_mask: torch.Tensor | None = None,
+        scan_limit: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Draft tokens from local history and the global index.
 
@@ -257,7 +301,7 @@ class SuffixGPUDrafter:
 
         if self.global_index is None:
             (draft, num_valid, _, _, _) = self.local_kernel(
-                num_tokens_no_spec, token_ids_gpu, combined_mask)
+                num_tokens_no_spec, token_ids_gpu, combined_mask, scan_limit)
         else:
             r = self.local_kernel.max_occurrences
             tails, tail_len = self._gather_tails(num_tokens_no_spec,
@@ -288,7 +332,7 @@ class SuffixGPUDrafter:
                 cand_l, cont_l, occ_l = \
                     self.local_kernel.gather_candidates(
                         num_tokens_no_spec, token_ids_gpu,
-                        combined_mask)
+                        combined_mask, scan_limit)
                 cur.wait_event(self._ps_join)
                 if not capturing:
                     for t in (g_len, g_cont, g_occ):
@@ -297,7 +341,7 @@ class SuffixGPUDrafter:
                 cand_l, cont_l, occ_l = \
                     self.local_kernel.gather_candidates(
                         num_tokens_no_spec, token_ids_gpu,
-                        combined_mask)
+                        combined_mask, scan_limit)
                 g_len, g_cont, g_occ = self.global_index._query_backoff(
                     tails.to(torch.int32), tail_len,
                     self.max_pattern_len, self._global_caps)
